@@ -1,0 +1,16 @@
+# oasis-generation model runner — GPU serving via vLLM's official image.
+# Weights are mounted at /models from a persistent block volume, never baked
+# in: images stay pullable in seconds and survive instance stop/start on the
+# EU cloud (Scaleway scratch NVMe is ERASED on full stop — block volume only).
+FROM vllm/vllm-openai:latest
+
+# MODEL_PATH and SERVED_NAME are injected by the wake controller / compose.
+ENV MODEL_PATH=/models/current \
+    SERVED_NAME=gemma-4-12b-it
+
+ENTRYPOINT ["/bin/sh", "-c", \
+  "exec python3 -m vllm.entrypoints.openai.api_server \
+     --model ${MODEL_PATH} \
+     --served-model-name ${SERVED_NAME} \
+     --host 0.0.0.0 --port 8000 \
+     ${VLLM_EXTRA_ARGS:-}"]

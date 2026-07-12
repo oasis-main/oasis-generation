@@ -1,0 +1,25 @@
+[project]
+name = "oasis-generation"
+version = "0.0.1"
+description = "Personal generative-inference sidecar: OpenAI-compatible gateway + on-demand model runners (EU cloud)"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.4",
+  "httpx>=0.27",
+]
+
+# The gateway stays CPU-slim; the GPU serving stack is an extra so the
+# gateway image never drags torch/CUDA along (see oasis-voice VOICE-001).
+[project.optional-dependencies]
+runner-vllm = ["vllm>=0.11"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

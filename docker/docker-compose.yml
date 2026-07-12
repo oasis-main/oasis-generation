@@ -1,0 +1,31 @@
+# Local dev: gateway only, proxying to Docker Model Runner on the host
+# (enable a model first: `docker model pull hf.co/unsloth/gemma-4-12b-it-gguf:Q4_K_M`).
+#
+#   docker compose -f docker/docker-compose.yml up gateway
+#
+# Cloud/GPU: `--profile gpu` adds the vLLM runner and points the gateway at it.
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    ports:
+      - "8800:8800"
+    environment:
+      OASIS_GENERATION_UPSTREAM_BASE_URL: ${OASIS_GENERATION_UPSTREAM_BASE_URL:-http://model-runner.docker.internal/engines/llama.cpp/v1}
+      OASIS_GENERATION_SERVICE_TOKENS: ${OASIS_GENERATION_SERVICE_TOKENS:-}
+
+  runner:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runner
+    volumes:
+      - ../models:/models   # gitignored; block-volume mount in the cloud
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

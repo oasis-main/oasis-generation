@@ -1,7 +1,7 @@
 # State — oasis-generation
 
 **2026-07-12 (Claude — repo bootstrap):**
-Skeleton created during the oasis-generative planning session (plan:
+Skeleton created during the oasis-generation planning session (plan:
 oasis-x/.swarm/GENERATIVE_PLAN.md). Decisions captured that day:
 
 - Provider: Scaleway primary / Nebius fallback (Mike approved 2026-07-12).

@@ -1,0 +1,11 @@
+#cloud-config
+# Boot sequence for a generation runner: mount weights volume, start the
+# vLLM runner container pointing at it. Weight download/sync is a one-time
+# provisioning step (or wake-time rsync) — never part of the image.
+runcmd:
+  - mkdir -p /models
+  - mount /dev/sdb /models || (mkfs.ext4 /dev/sdb && mount /dev/sdb /models)
+  - docker run -d --restart unless-stopped --gpus all -p 8000:8000
+    -v /models:/models
+    -e SERVED_NAME=${served_name}
+    ${runner_image}

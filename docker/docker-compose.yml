@@ -9,6 +9,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
+    restart: unless-stopped  # fleet dependency: Nimbus's oasis-generation provider
     ports:
       - "8800:8800"
     environment:

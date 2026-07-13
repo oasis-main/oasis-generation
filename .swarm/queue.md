@@ -70,7 +70,12 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
       depends: GEN-001
       notes: Instance state machine (asleep/warming/ready) surfaced in API;
              wake-on-request returns 202 + Retry-After or streamed warming
-             events; idle timer stops the instance. Control-plane routers
+             events; idle timer stops the instance. Mike spec 2026-07-13:
+             activity = AUTHORIZED requests only (valid service token);
+             idle_timeout default 3600 s, per-instance override; Telegram
+             surface = small fleet plugin (/gen: states + wake/sleep
+             buttons, model-switcher pattern) — design in GENERATIVE_PLAN
+             §3.1. Control-plane routers
              (/instances /models /adapters) live in oasis-cloud/src/ai —
              this repo ships the runner-side agent + gateway hooks.
              Capacity-miss path: no GPU at power-on -> queue with ETA +

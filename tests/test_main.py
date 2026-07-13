@@ -20,10 +20,13 @@ def test_models_lists_only_enabled():
     resp = client.get("/v1/models")
     assert resp.status_code == 200
     ids = [m["id"] for m in resp.json()["data"]]
-    assert "gemma-4-12b-it" in ids
-    # Community fine-tunes stay hidden until GEN-002 clears them.
-    assert "gemma-4-12b-coder" not in ids
-    assert "gemma-4-12b-agentic" not in ids
+    # GEN-002 pass 2026-07-12 cleared both community fine-tunes for
+    # personal/fleet use; baseline is disabled until re-pulled or cloud-hosted.
+    assert "gemma-4-12b-coder" in ids
+    assert "gemma-4-12b-agentic" in ids
+    assert "gemma-4-12b-it" not in ids
+    # Higher tiers stay hidden until their runners exist.
+    assert "glm-5.2" not in ids
 
 
 def test_unknown_model_404s():

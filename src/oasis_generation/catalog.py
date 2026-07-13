@@ -21,22 +21,27 @@ CATALOG: list[CatalogEntry] = [
         public_id="gemma-4-12b-it",
         upstream_id="huggingface.co/unsloth/gemma-4-12b-it-gguf:Q4_K_M",
         tier="S",
-        enabled=True,
-        notes="Baseline tier-S. Local dev id shown; cloud runner uses the HF bf16/FP8 checkpoint.",
+        enabled=False,
+        notes="Baseline tier-S. Local copy removed 2026-07-13 (disk); re-pull or re-enable "
+        "on the cloud runner (HF bf16/FP8 checkpoint).",
     ),
     CatalogEntry(
         public_id="gemma-4-12b-coder",
-        upstream_id="huggingface.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF",
+        upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-coder-fable5-composer2.5-v1-gguf:Q4_K_M",
         tier="S",
-        enabled=False,
-        notes="Community distill (Composer 2.5 + Fable 5 traces). BLOCKED on GEN-002 vetting.",
+        enabled=True,
+        notes="Community distill (Composer 2.5 + Fable 5 traces). GEN-002 pass 2026-07-12: "
+        "cleared for personal/fleet use; customer tier still blocked. "
+        "Pinned HF rev 1380be1796e559fca96b4107599285cab3ddbb92.",
     ),
     CatalogEntry(
         public_id="gemma-4-12b-agentic",
-        upstream_id="huggingface.co/yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2",
+        upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-agentic-fable5-composer2.5-v2-3.5x-tau2-gguf:Q4_K_M",
         tier="S",
-        enabled=False,
-        notes="Community distill, tau2-telecom ~55% vs ~15% base (author-run). BLOCKED on GEN-002 vetting.",
+        enabled=True,
+        notes="Community distill, tau2-telecom ~55% vs ~15% base (author-run). GEN-002 pass "
+        "2026-07-12 incl. exfil-via-tool-injection probe: cleared for personal/fleet use; "
+        "customer tier still blocked. Pinned HF rev 190a31365a6b80a692349be34ccdac730cad4fe4.",
     ),
     CatalogEntry(
         public_id="gemma-4-31b-it",

@@ -22,9 +22,17 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              power-off (per-minute, storage-only when stopped — confirmed in
              docs 2026-07-12, confirm on invoice). Budget: < EUR 20.
 
-- [ ] [GEN-002] [OPEN] Security + license vetting of community Gemma-4-12B fine-tunes
-      priority: high | project: catalog | division: GEN
-      notes: Candidates (disabled in catalog.py until this clears):
+- [ ] [GEN-002] [PARTIAL — personal/fleet tier CLEARED 2026-07-13] Security + license vetting of community Gemma-4-12B fine-tunes
+      priority: medium (was high) | project: catalog | division: GEN
+      notes: FIRST PASS DONE — see docs/GEN-002-vetting.md. Both variants
+             passed behavioral probes (incl. exfil-via-tool-injection on the
+             agentic model); enabled=true + revision-pinned in catalog.py
+             2026-07-13; Mike waived the license question for personal use
+             (fallback = vanilla Gemma/GLM/DeepSeek + own fine-tunes).
+             REMAINS OPEN for the customer/paid tier only: multi-turn /
+             jailbreak-framed / multi-category red-team + license/provenance
+             legal read. Original checklist below for that phase.
+             Candidates (now enabled for personal/fleet):
                - yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF (Q4_K_M 7.38 GB)
                - yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2 (safetensors + GGUF repo)
              Both: Apache-2.0-labeled distills of google/gemma-4-12B-it from

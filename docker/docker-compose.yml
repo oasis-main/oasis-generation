@@ -10,6 +10,12 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.gateway
     restart: unless-stopped  # fleet dependency: Nimbus's oasis-generation provider
+    # Defensive cap only — the gateway is a ~100 MB proxy, NOT the memory user.
+    # The 12 GB hog is Docker Model Runner (llama.cpp on the host, Metal), which
+    # is not a container and cannot be mem_limited here. memswap_limit == mem_limit
+    # forbids this container from touching swap (guards against a swap spiral).
+    mem_limit: 512m
+    memswap_limit: 512m
     ports:
       - "8800:8800"
     environment:

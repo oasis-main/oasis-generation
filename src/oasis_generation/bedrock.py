@@ -1,0 +1,414 @@
+"""Amazon Bedrock backend for the gateway (GEN-003).
+
+Translates OpenAI chat-completions <-> Bedrock Converse so the gateway can front
+Bedrock-hosted models (Claude, GLM, DeepSeek, Llama, Nova, GPT-OSS, …) behind
+the same OpenAI-compatible surface as the self-hosted runners. Direct boto3
+(not a proxy library) so brand-new 2026 model ids work regardless of any third
+party's model map — the Converse API takes an arbitrary model/inference-profile
+id and streams generically.
+
+Auth is the AWS SDK default credential chain (env keys / profile / role): the
+gateway process holds the key, the bots never do — which is the GEN-003 security
+interlock (bot egress collapses to gateway + Telegram).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from collections.abc import AsyncIterator
+from functools import lru_cache
+from typing import Any
+
+import boto3
+from botocore.config import Config as BotoConfig
+
+logger = logging.getLogger(__name__)
+
+# Bedrock Converse requires a maxTokens; use a generous default when the caller
+# omits it (some clients only send it on demand).
+_DEFAULT_MAX_TOKENS = 4096
+
+# Converse stopReason -> OpenAI finish_reason.
+_FINISH_REASON = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "content_filtered": "content_filter",
+    "guardrail_intervened": "content_filter",
+}
+
+
+@lru_cache(maxsize=8)
+def _client(region: str):
+    # Reuse one client per region across requests (thread-safe for calls).
+    # "standard" mode retries transient errors (throttling, 5xx, timeouts) with
+    # exponential backoff + full jitter *before* we ever see them — applies to
+    # the initial request that opens converse_stream(), not to a stream already
+    # in progress, so it can't duplicate partial output. max_attempts=4 (1
+    # original + 3 retries) rides out a brief throttle without masking a real
+    # outage for too long. The gateway wraps this in its own timeout.
+    cfg = BotoConfig(retries={"max_attempts": 4, "mode": "standard"}, read_timeout=300)
+    return boto3.client("bedrock-runtime", region_name=region, config=cfg)
+
+
+def _content_to_text(content: Any) -> str:
+    """Flatten OpenAI message content (str | list of parts) to plain text.
+
+    v0 is text-only: image/audio parts are dropped (Converse multimodal is a
+    later extension). Reasoning is handled on the response side, not here.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in (None, "text") and "text" in part:
+                out.append(str(part["text"]))
+            elif isinstance(part, str):
+                out.append(part)
+        return "".join(out)
+    return "" if content is None else str(content)
+
+
+def _parse_tool_args(raw: Any) -> dict:
+    """OpenAI carries tool-call arguments as a JSON *string*; Converse toolUse
+    wants the parsed object. Tolerate dicts (already parsed), empty, and
+    malformed JSON (model mid-stream fragments should never crash a request)."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _tool_choice_to_converse(choice: Any) -> dict | None:
+    """OpenAI tool_choice -> Converse toolChoice.
+
+    "auto"/None -> None: Converse defaults to auto when tools are present, and
+    omitting the field is the most cross-model-compatible option (some Bedrock
+    models reject an explicit "any"/"tool" choice). "none" is handled upstream
+    in _tools_to_converse (drop the tools entirely).
+    """
+    if choice == "required":
+        return {"any": {}}
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        name = (choice.get("function") or {}).get("name")
+        if name:
+            return {"tool": {"name": name}}
+    return None
+
+
+def _tools_to_converse(body: dict) -> dict | None:
+    """OpenAI `tools` + `tool_choice` -> Converse `toolConfig`, or None when the
+    caller sent no usable tools (or tool_choice="none")."""
+    tools = body.get("tools")
+    if not tools or body.get("tool_choice") == "none":
+        return None
+    specs: list[dict] = []
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        spec: dict[str, Any] = {
+            "name": name,
+            # Converse nests the JSON Schema one level down under "json".
+            "inputSchema": {"json": fn.get("parameters") or {"type": "object", "properties": {}}},
+        }
+        if fn.get("description"):
+            spec["description"] = fn["description"]
+        specs.append({"toolSpec": spec})
+    if not specs:
+        return None
+    cfg: dict[str, Any] = {"tools": specs}
+    choice = _tool_choice_to_converse(body.get("tool_choice"))
+    if choice is not None:
+        cfg["toolChoice"] = choice
+    return cfg
+
+
+def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
+    """Return (converse_role, content_blocks) for one non-system OpenAI message.
+
+    Preserves tool structure so multi-turn tool loops survive the round-trip:
+      assistant.tool_calls -> {"toolUse": ...} blocks
+      role "tool"          -> a user-turn {"toolResult": ...} block
+    """
+    role = msg.get("role")
+    if role == "tool":
+        # A tool result is delivered to Converse inside a *user* turn.
+        result_text = _content_to_text(msg.get("content"))
+        return "user", [
+            {
+                "toolResult": {
+                    "toolUseId": msg.get("tool_call_id") or "",
+                    # Converse rejects an empty content list; keep a placeholder.
+                    "content": [{"text": result_text or "(no content)"}],
+                }
+            }
+        ]
+    if role == "assistant":
+        blocks: list[dict] = []
+        text = _content_to_text(msg.get("content"))
+        if text:
+            blocks.append({"text": text})
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            blocks.append(
+                {
+                    "toolUse": {
+                        "toolUseId": tc.get("id") or "",
+                        "name": fn.get("name") or "",
+                        "input": _parse_tool_args(fn.get("arguments")),
+                    }
+                }
+            )
+        return "assistant", blocks
+    # user (and any other role) -> user text.
+    text = _content_to_text(msg.get("content"))
+    return "user", ([{"text": text}] if text else [])
+
+
+def openai_to_converse(body: dict) -> dict[str, Any]:
+    """Build converse()/converse_stream() kwargs (minus modelId) from an OpenAI
+    chat-completions body."""
+    system_parts: list[dict] = []
+    messages: list[dict] = []
+    for msg in body.get("messages", []):
+        if msg.get("role") == "system":
+            text = _content_to_text(msg.get("content"))
+            if text:
+                system_parts.append({"text": text})
+            continue
+        conv_role, blocks = _message_to_blocks(msg)
+        if not blocks:
+            continue
+        # Converse requires strictly alternating roles; merge consecutive same-role.
+        if messages and messages[-1]["role"] == conv_role:
+            messages[-1]["content"].extend(blocks)
+        else:
+            messages.append({"role": conv_role, "content": blocks})
+
+    inference: dict[str, Any] = {"maxTokens": int(body.get("max_tokens") or _DEFAULT_MAX_TOKENS)}
+    if body.get("temperature") is not None:
+        inference["temperature"] = float(body["temperature"])
+    if body.get("top_p") is not None:
+        inference["topP"] = float(body["top_p"])
+    stop = body.get("stop")
+    if stop:
+        inference["stopSequences"] = [stop] if isinstance(stop, str) else list(stop)
+
+    kwargs: dict[str, Any] = {"messages": messages, "inferenceConfig": inference}
+    if system_parts:
+        kwargs["system"] = system_parts
+    tool_cfg = _tools_to_converse(body)
+    if tool_cfg:
+        kwargs["toolConfig"] = tool_cfg
+    return kwargs
+
+
+def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
+    """Return (text, reasoning_text, tool_calls) from a Converse content list.
+
+    tool_calls are already in OpenAI shape: Converse `input` (an object) is
+    re-serialized to the JSON *string* OpenAI clients expect in `arguments`.
+    """
+    text_parts, reasoning_parts, tool_calls = [], [], []
+    for block in content_blocks or []:
+        if "text" in block:
+            text_parts.append(block["text"])
+        elif "reasoningContent" in block:
+            rc = block["reasoningContent"]
+            rt = (rc.get("reasoningText") or {}).get("text") if isinstance(rc, dict) else None
+            if rt:
+                reasoning_parts.append(rt)
+        elif "toolUse" in block:
+            tu = block["toolUse"] or {}
+            tool_calls.append(
+                {
+                    "id": tu.get("toolUseId") or "",
+                    "type": "function",
+                    "function": {
+                        "name": tu.get("name") or "",
+                        "arguments": json.dumps(tu.get("input") or {}),
+                    },
+                }
+            )
+    return "".join(text_parts), "".join(reasoning_parts), tool_calls
+
+
+def _usage(u: dict | None) -> dict:
+    u = u or {}
+    return {
+        "prompt_tokens": u.get("inputTokens", 0),
+        "completion_tokens": u.get("outputTokens", 0),
+        "total_tokens": u.get("totalTokens", 0),
+        # Passed through so callers (e.g. the sleep-cycle context-nap) can see
+        # the true prompt size including cached tokens.
+        "cache_read_input_tokens": u.get("cacheReadInputTokens", 0),
+        "cache_write_input_tokens": u.get("cacheWriteInputTokens", 0),
+    }
+
+
+def converse_to_openai(resp: dict, public_id: str, completion_id: str, created: int) -> dict:
+    """Bedrock converse() response -> OpenAI chat.completion object."""
+    message = (resp.get("output") or {}).get("message") or {}
+    text, reasoning, tool_calls = _extract_content(message.get("content") or [])
+    msg: dict[str, Any] = {"role": "assistant", "content": text}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+        # OpenAI convention: content is null on a pure tool-call turn.
+        if not text:
+            msg["content"] = None
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": public_id,
+        "choices": [
+            {
+                "index": 0,
+                "message": msg,
+                "finish_reason": _FINISH_REASON.get(resp.get("stopReason", ""), "stop"),
+            }
+        ],
+        "usage": _usage(resp.get("usage")),
+    }
+
+
+async def complete(model_id: str, body: dict, region: str, public_id: str) -> dict:
+    """Non-streaming completion. boto3 is sync, so run it off the event loop."""
+    kwargs = openai_to_converse(body)
+    try:
+        resp = await asyncio.to_thread(_client(region).converse, modelId=model_id, **kwargs)
+    except Exception:
+        logger.exception(
+            "bedrock complete() failed model_id=%s public_id=%s region=%s",
+            model_id, public_id, region,
+        )
+        raise
+    return converse_to_openai(
+        resp, public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
+    )
+
+
+def _sse(obj: dict) -> bytes:
+    return f"data: {json.dumps(obj)}\n\n".encode()
+
+
+async def stream(model_id: str, body: dict, region: str, public_id: str) -> AsyncIterator[bytes]:
+    """Streaming completion as OpenAI SSE chunks.
+
+    boto3's converse_stream returns a synchronous EventStream; iterate it in a
+    worker thread and hand chunks to the async generator via a queue so the
+    FastAPI event loop is never blocked.
+    """
+    kwargs = openai_to_converse(body)
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+
+    def base(delta: dict, finish: str | None = None) -> dict:
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": public_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def worker() -> None:
+        try:
+            resp = _client(region).converse_stream(modelId=model_id, **kwargs)
+            for event in resp["stream"]:
+                loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
+        except Exception as exc:  # surface upstream errors into the stream
+            # Previously this was swallowed with no server-side trace at all —
+            # a throttled/erroring call would show as a clean "200 OK" in the
+            # access log with an empty reply on the client end. Log it here so
+            # a repeat is diagnosable from `docker logs` instead of guesswork.
+            logger.exception(
+                "bedrock stream() failed model_id=%s public_id=%s region=%s",
+                model_id, public_id, region,
+            )
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    loop.run_in_executor(None, worker)
+
+    # Open with the assistant role so clients see a well-formed first chunk.
+    yield _sse(base({"role": "assistant"}))
+    finish_reason = "stop"
+    usage: dict | None = None
+    # Converse indexes content blocks (text and tool calls share one sequence);
+    # OpenAI indexes tool_calls on their own. Map block index -> tool_call index.
+    tool_index_by_block: dict[int, int] = {}
+    next_tool_index = 0
+    while True:
+        kind, payload = await queue.get()
+        if kind == "done":
+            break
+        if kind == "error":
+            # Emit a terminal error frame, then close cleanly.
+            yield _sse(base({}, "stop") | {"error": str(payload)})
+            break
+        event = payload
+        if "contentBlockStart" in event:
+            # A tool call opens here: id + name arrive now, arguments stream as
+            # toolUse.input deltas on the matching contentBlockIndex.
+            start = event["contentBlockStart"].get("start") or {}
+            tu = start.get("toolUse")
+            if tu:
+                block_idx = event["contentBlockStart"].get("contentBlockIndex")
+                tool_index_by_block[block_idx] = next_tool_index
+                yield _sse(base({"tool_calls": [{
+                    "index": next_tool_index,
+                    "id": tu.get("toolUseId") or "",
+                    "type": "function",
+                    "function": {"name": tu.get("name") or "", "arguments": ""},
+                }]}))
+                next_tool_index += 1
+        elif "contentBlockDelta" in event:
+            cbd = event["contentBlockDelta"]
+            delta = cbd.get("delta", {})
+            if "text" in delta:
+                yield _sse(base({"content": delta["text"]}))
+            elif "toolUse" in delta:
+                # Partial JSON string fragment for the open tool call.
+                tool_idx = tool_index_by_block.get(cbd.get("contentBlockIndex"), 0)
+                yield _sse(base({"tool_calls": [{
+                    "index": tool_idx,
+                    "function": {"arguments": (delta["toolUse"] or {}).get("input", "")},
+                }]}))
+            elif "reasoningContent" in delta:
+                rt = (delta["reasoningContent"] or {}).get("text")
+                if rt:
+                    yield _sse(base({"reasoning_content": rt}))
+        elif "messageStop" in event:
+            finish_reason = _FINISH_REASON.get(
+                event["messageStop"].get("stopReason", ""), "stop"
+            )
+        elif "metadata" in event and include_usage:
+            usage = _usage(event["metadata"].get("usage"))
+
+    final = base({}, finish_reason)
+    if include_usage and usage is not None:
+        final["usage"] = usage
+    yield _sse(final)
+    yield b"data: [DONE]\n\n"

@@ -21,16 +21,64 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import boto3
 from botocore.config import Config as BotoConfig
+
+if TYPE_CHECKING:  # avoid a runtime import cycle; only used for typing.
+    from .catalog import InferenceDefaults
 
 logger = logging.getLogger(__name__)
 
 # Bedrock Converse requires a maxTokens; use a generous default when the caller
 # omits it (some clients only send it on demand).
 _DEFAULT_MAX_TOKENS = 4096
+
+# OpenAI-wire `reasoning_effort` -> Anthropic/Bedrock effort. openclaw emits
+# minimal/low/medium/high; xhigh/max pass through if a caller uses them.
+_EFFORT_ALIASES = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+
+def _resolve_inference(
+    body: dict, defaults: "InferenceDefaults | None"
+) -> tuple[str, str | None, int, bool, bool]:
+    """Resolve the effective inference knobs for one request.
+
+    Precedence (design doc §7.5): explicit request field > selected profile >
+    per-model catalog default. Returns (thinking_mode, effort, max_tokens,
+    allow_temperature, allow_sampling). With no catalog `inference` block this
+    degrades to legacy behaviour (native thinking, sampling allowed, default
+    max_tokens) so untyped models keep working unchanged.
+    """
+    thinking = defaults.thinking if defaults else "native"
+    allow_temp = defaults.allow_temperature if defaults else True
+    allow_samp = defaults.allow_sampling if defaults else True
+
+    effort: str | None = None
+    profile_max: int | None = None
+    if defaults and defaults.profiles:
+        name = body.get("profile") or defaults.default_profile
+        prof = defaults.profiles.get(name) or defaults.profiles.get(defaults.default_profile)
+        if prof:
+            effort = prof.effort
+            profile_max = prof.max_tokens
+
+    # An explicit reasoning_effort on the request overrides the profile's effort.
+    requested_effort = body.get("reasoning_effort")
+    if requested_effort:
+        effort = _EFFORT_ALIASES.get(str(requested_effort).lower(), effort)
+
+    # max_tokens: explicit request wins, else the profile, else the flat default.
+    max_tokens = int(body.get("max_tokens") or profile_max or _DEFAULT_MAX_TOKENS)
+    return thinking, effort, max_tokens, allow_temp, allow_samp
 
 # Converse stopReason -> OpenAI finish_reason.
 _FINISH_REASON = {
@@ -179,9 +227,15 @@ def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
     return "user", ([{"text": text}] if text else [])
 
 
-def openai_to_converse(body: dict) -> dict[str, Any]:
+def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) -> dict[str, Any]:
     """Build converse()/converse_stream() kwargs (minus modelId) from an OpenAI
-    chat-completions body."""
+    chat-completions body, applying the model's inference policy (`defaults`).
+
+    The policy controls thinking/effort (via `additionalModelRequestFields`),
+    the per-profile max_tokens, and whether temperature/top_p are allowed —
+    keeping every request valid for the target model (e.g. no `temperature` on
+    the adaptive-Claude removed-set, which 400s). `defaults=None` = legacy
+    passthrough."""
     system_parts: list[dict] = []
     messages: list[dict] = []
     for msg in body.get("messages", []):
@@ -199,10 +253,15 @@ def openai_to_converse(body: dict) -> dict[str, Any]:
         else:
             messages.append({"role": conv_role, "content": blocks})
 
-    inference: dict[str, Any] = {"maxTokens": int(body.get("max_tokens") or _DEFAULT_MAX_TOKENS)}
-    if body.get("temperature") is not None:
+    thinking_mode, effort, max_tokens, allow_temp, allow_samp = _resolve_inference(body, defaults)
+    thinking_on = thinking_mode in ("adaptive", "always_on")
+
+    inference: dict[str, Any] = {"maxTokens": max_tokens}
+    # Temperature/top_p: honoured only if the model allows them AND thinking is
+    # off (Anthropic rejects sampling params while extended thinking is active).
+    if body.get("temperature") is not None and allow_temp and not thinking_on:
         inference["temperature"] = float(body["temperature"])
-    if body.get("top_p") is not None:
+    if body.get("top_p") is not None and allow_samp and not thinking_on:
         inference["topP"] = float(body["top_p"])
     stop = body.get("stop")
     if stop:
@@ -214,6 +273,17 @@ def openai_to_converse(body: dict) -> dict[str, Any]:
     tool_cfg = _tools_to_converse(body)
     if tool_cfg:
         kwargs["toolConfig"] = tool_cfg
+
+    # Extended thinking + effort ride in additionalModelRequestFields (verified
+    # accepted on Converse for opus-4-8 / sonnet-5, 2026-07-24). "off"/"native"
+    # inject nothing so the model's own default behaviour stands.
+    amrf: dict[str, Any] = {}
+    if thinking_mode == "adaptive":
+        amrf["thinking"] = {"type": "adaptive"}
+    if thinking_on and effort:
+        amrf["output_config"] = {"effort": effort}
+    if amrf:
+        kwargs["additionalModelRequestFields"] = amrf
     return kwargs
 
 
@@ -288,9 +358,12 @@ def converse_to_openai(resp: dict, public_id: str, completion_id: str, created: 
     }
 
 
-async def complete(model_id: str, body: dict, region: str, public_id: str) -> dict:
+async def complete(
+    model_id: str, body: dict, region: str, public_id: str,
+    defaults: "InferenceDefaults | None" = None,
+) -> dict:
     """Non-streaming completion. boto3 is sync, so run it off the event loop."""
-    kwargs = openai_to_converse(body)
+    kwargs = openai_to_converse(body, defaults)
     try:
         resp = await asyncio.to_thread(_client(region).converse, modelId=model_id, **kwargs)
     except Exception:
@@ -308,14 +381,17 @@ def _sse(obj: dict) -> bytes:
     return f"data: {json.dumps(obj)}\n\n".encode()
 
 
-async def stream(model_id: str, body: dict, region: str, public_id: str) -> AsyncIterator[bytes]:
+async def stream(
+    model_id: str, body: dict, region: str, public_id: str,
+    defaults: "InferenceDefaults | None" = None,
+) -> AsyncIterator[bytes]:
     """Streaming completion as OpenAI SSE chunks.
 
     boto3's converse_stream returns a synchronous EventStream; iterate it in a
     worker thread and hand chunks to the async generator via a queue so the
     FastAPI event loop is never blocked.
     """
-    kwargs = openai_to_converse(body)
+    kwargs = openai_to_converse(body, defaults)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))

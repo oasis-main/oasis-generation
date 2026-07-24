@@ -98,17 +98,31 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
         try:
             if body.get("stream"):
                 return StreamingResponse(
-                    bedrock.stream(entry.upstream_id, body, settings.bedrock_region, entry.public_id),
+                    bedrock.stream(
+                        entry.upstream_id, body, settings.bedrock_region,
+                        entry.public_id, entry.inference,
+                    ),
                     media_type="text/event-stream",
                 )
             payload = await bedrock.complete(
-                entry.upstream_id, body, settings.bedrock_region, entry.public_id
+                entry.upstream_id, body, settings.bedrock_region,
+                entry.public_id, entry.inference,
             )
             return JSONResponse(payload)
         except HTTPException:
             raise
         except Exception as exc:  # boto/credential/model errors -> 502
             raise HTTPException(status_code=502, detail=f"bedrock error: {exc}") from exc
+
+    if entry.backend == "bedrock_mantle":
+        # GPT-5.6-sol et al. — OpenAI Responses API on the bedrock-mantle
+        # endpoint, not Converse (design doc §2.4). Catalog entries stay
+        # disabled until that backend lands; this guard is defensive in case
+        # one is enabled prematurely.
+        raise HTTPException(
+            status_code=501,
+            detail=f"{entry.public_id}: bedrock_mantle (OpenAI Responses) backend not yet implemented",
+        )
 
     if entry.backend == "openai_compat":
         if not entry.base_url:

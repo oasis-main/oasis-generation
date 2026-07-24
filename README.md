@@ -33,15 +33,20 @@ never hold a provider key, and egress collapses to gateway + Telegram. This also
 means the aspirational self-hosted tiers above (`glm-5.2`, `deepseek-v4-*`) are
 usable **now** via proxying, with the owned-runner path as the future scale-up.
 
-| Public id | Bedrock model / inference profile |
-|-----------|-----------------------------------|
-| `claude-sonnet-4-6` | `us.anthropic.claude-sonnet-4-6` |
-| `claude-opus-4-8` | `us.anthropic.claude-opus-4-8` |
-| `claude-haiku-4-5` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| `gpt-oss-120b` | `openai.gpt-oss-120b-1:0` |
-| `glm-5` | `zai.glm-5` |
-| `deepseek-v3.2` | `deepseek.v3.2` |
-| `llama-4-maverick` | `us.meta.llama4-maverick-17b-instruct-v1:0` |
+Roster trimmed 2026-07-24 (see `oasis-x/.swarm/GENERATIVE_BEDROCK_INFERENCE_DESIGN.md`):
+
+| Public id | Bedrock model / inference profile | Inference |
+|-----------|-----------------------------------|-----------|
+| `claude-opus-4-8` | `us.anthropic.claude-opus-4-8` | adaptive thinking; effort low/high/xhigh; no temperature |
+| `claude-sonnet-5` | `us.anthropic.claude-sonnet-5` | adaptive thinking; effort low/high/high; no temperature |
+| `glm-5` | `zai.glm-5` | native thinking (effort probe-pending) |
+
+Each model carries an `inference` policy (thinking/effort/temperature + `fast`/
+`balanced`/`deep` profiles) the gateway enforces, so the fleet inherits consistent,
+valid settings — callers select a profile (`"profile": "deep"`) or override effort
+(`reasoning_effort`) / `max_tokens`, and invalid combos (e.g. temperature on the
+removed-set) are stripped. `GPT-5.6-sol` is staged as a disabled `bedrock_mantle`
+entry (OpenAI Responses API endpoint — needs a separate backend module).
 
 Auth is the AWS SDK default chain — set `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
 (+ `AWS_REGION`) on the gateway (see `docker/.env.example`). Direct

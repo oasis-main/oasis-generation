@@ -6,7 +6,13 @@ Converse smoke test run 2026-07-15 against oasis-dev.
 
 import json
 
-from oasis_generation import bedrock
+from oasis_generation import bedrock, catalog
+
+
+def _inference(public_id: str):
+    """The catalog's inference policy for a model (ties these tests to the real
+    per-model config so drift is caught)."""
+    return next(m for m in catalog.CATALOG if m.public_id == public_id).inference
 
 
 # ---- OpenAI -> Converse -----------------------------------------------------
@@ -147,9 +153,9 @@ _CONVERSE_RESP = {
 
 
 def test_converse_to_openai_shape():
-    out = bedrock.converse_to_openai(_CONVERSE_RESP, "claude-haiku-4-5", "chatcmpl-x", 1234)
+    out = bedrock.converse_to_openai(_CONVERSE_RESP, "claude-sonnet-5", "chatcmpl-x", 1234)
     assert out["object"] == "chat.completion"
-    assert out["model"] == "claude-haiku-4-5"
+    assert out["model"] == "claude-sonnet-5"
     assert out["choices"][0]["message"] == {"role": "assistant", "content": "Hi! 👋"}
     assert out["choices"][0]["finish_reason"] == "length"  # max_tokens -> length
     assert out["usage"]["prompt_tokens"] == 9
@@ -185,7 +191,7 @@ def test_converse_to_openai_tool_calls():
         "stopReason": "tool_use",
         "usage": {},
     }
-    out = bedrock.converse_to_openai(resp, "claude-sonnet-4-6", "id", 0)
+    out = bedrock.converse_to_openai(resp, "claude-opus-4-8", "id", 0)
     msg = out["choices"][0]["message"]
     # Pure tool-call turn: content null, one OpenAI-shaped tool_call.
     assert msg["content"] is None
@@ -272,7 +278,7 @@ def test_stream_tool_calls(monkeypatch):
     import asyncio
 
     body = {"messages": [{"role": "user", "content": "check inbox"}], "stream": True}
-    chunks = asyncio.run(_collect(bedrock.stream("m", body, "us-east-1", "claude-sonnet-4-6")))
+    chunks = asyncio.run(_collect(bedrock.stream("m", body, "us-east-1", "claude-sonnet-5")))
     frames = [json.loads(d) for d in _parse_sse(chunks) if d != "[DONE]"]
 
     # Collect every tool_calls delta across the stream.
@@ -289,3 +295,71 @@ def test_stream_tool_calls(monkeypatch):
     assert args == '{"id":"42"}'
     # Terminal frame maps tool_use -> tool_calls.
     assert frames[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+# ---- inference policy: thinking / effort / temperature (param unification) ---
+
+
+def test_adaptive_claude_injects_thinking_and_strips_sampling():
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.7,  # must be dropped — opus-4-8 400s on it
+        "top_p": 0.9,
+    }
+    kw = bedrock.openai_to_converse(body, _inference("claude-opus-4-8"))
+    amrf = kw["additionalModelRequestFields"]
+    assert amrf["thinking"] == {"type": "adaptive"}
+    assert amrf["output_config"] == {"effort": "high"}  # balanced default
+    assert "temperature" not in kw["inferenceConfig"]
+    assert "topP" not in kw["inferenceConfig"]
+    assert kw["inferenceConfig"]["maxTokens"] == 16000  # balanced profile
+
+
+def test_profile_deep_uses_top_effort_and_max_tokens():
+    body = {"messages": [{"role": "user", "content": "hi"}], "profile": "deep"}
+    opus = bedrock.openai_to_converse(body, _inference("claude-opus-4-8"))
+    assert opus["additionalModelRequestFields"]["output_config"] == {"effort": "xhigh"}
+    assert opus["inferenceConfig"]["maxTokens"] == 32000
+    # Sonnet 5 caps deep effort at high.
+    sonnet = bedrock.openai_to_converse(body, _inference("claude-sonnet-5"))
+    assert sonnet["additionalModelRequestFields"]["output_config"] == {"effort": "high"}
+
+
+def test_reasoning_effort_override_beats_profile_default():
+    inf = _inference("claude-opus-4-8")
+    low = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"}, inf
+    )
+    assert low["additionalModelRequestFields"]["output_config"] == {"effort": "low"}
+    # OpenAI "minimal" maps to Anthropic "low".
+    minimal = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "minimal"}, inf
+    )
+    assert minimal["additionalModelRequestFields"]["output_config"] == {"effort": "low"}
+
+
+def test_explicit_max_tokens_overrides_profile():
+    kw = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 500},
+        _inference("claude-opus-4-8"),
+    )
+    assert kw["inferenceConfig"]["maxTokens"] == 500
+
+
+def test_native_model_injects_nothing_and_keeps_temperature():
+    kw = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.3},
+        _inference("glm-5"),
+    )
+    assert "additionalModelRequestFields" not in kw  # native thinking, no injection
+    assert kw["inferenceConfig"]["temperature"] == 0.3  # glm-5 allows sampling
+    assert kw["inferenceConfig"]["maxTokens"] == 8192  # native balanced default
+
+
+def test_no_inference_defaults_is_legacy_passthrough():
+    kw = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.5}
+    )  # defaults=None
+    assert "additionalModelRequestFields" not in kw
+    assert kw["inferenceConfig"]["temperature"] == 0.5
+    assert kw["inferenceConfig"]["maxTokens"] == bedrock._DEFAULT_MAX_TOKENS

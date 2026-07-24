@@ -75,13 +75,29 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              gateway's env_file (docker/.env.example); bots hold nothing.
              Verified end-to-end (non-stream + stream + glm-5) 2026-07-15;
              12 tests green (6 bedrock translation + routing).
+      DONE 2026-07-24 — inference-param unification (design doc
+             oasis-x/.swarm/GENERATIVE_BEDROCK_INFERENCE_DESIGN.md). catalog.py
+             gained `InferenceDefaults`/`Profile` per model (thinking/effort/
+             temperature + fast|balanced|deep profiles); bedrock.py now injects
+             thinking={"type":"adaptive"} + output_config.effort via
+             additionalModelRequestFields (verified accepted live) and strips
+             temperature/top_p on the removed-set (opus-4.8/sonnet-5 400 on them).
+             Precedence: explicit request > profile > catalog default. Roster
+             trimmed: added claude-sonnet-5; removed sonnet-4-6/haiku-4-5/
+             gpt-oss-120b/deepseek-v3.2/llama-4-maverick; glm-5 kept (native,
+             effort probe-pending). gpt-5.6-sol staged DISABLED as a new
+             `bedrock_mantle` backend (OpenAI Responses endpoint — not built).
+             23 tests green.
       STILL OPEN: per-bot service tokens with rate/spend caps; structured usage
-             events for metering (ties to oasis-gateway-billing); openai_compat
-             enablement for real GPT if wanted. FOLLOW-ON (oasis-claw repo):
-             add these model ids to the bots' `oasis-generation` provider
-             catalog with correct context windows (Claude=200K, not 32K) and,
-             if desired, put `oasis-generation/claude-sonnet-4-6` in Nimbus's
-             fallback chain as a personal-billed Claude route.
+             events for metering (ties to oasis-gateway-billing); the
+             `bedrock_mantle`/Responses backend for gpt-5.6-sol; /v1/models
+             capability descriptors (design §7.7) for the Telegram /genconfig
+             surface; GLM-5 reasoning capability probe. FOLLOW-ON (oasis-claw
+             repo): the durable entrypoint still registers the OLD 9-model
+             roster (incl. the 5 removed here) + a fallback chain referencing
+             oasis-generation/claude-sonnet-4-6 — update it to the trimmed
+             roster (opus-4-8/sonnet-5/glm-5 + gemma) with correct context
+             windows, or those refs 404 against the gateway.
 
 - [ ] [GEN-004] [OPEN] Wake/sleep controller + oasis-ai control-plane integration
       priority: medium | project: infra | division: GEN

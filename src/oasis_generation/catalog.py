@@ -14,9 +14,13 @@ Backends (GEN-003 provider fanout):
                      to send it and which env var holds the key.
   - "bedrock"      — Amazon Bedrock via the Converse API. `upstream_id` is the
                      Bedrock model id or inference-profile id (e.g.
-                     `us.anthropic.claude-sonnet-4-6`). Auth is the AWS SDK
+                     `us.anthropic.claude-opus-4-8`). Auth is the AWS SDK
                      default credential chain (the gateway holds the key; bots
                      never do). See bedrock.py.
+  - "bedrock_mantle"— Amazon Bedrock **mantle** endpoint via the OpenAI Responses
+                     API (GPT-5.6-sol). NOT Converse. `base_url` is the mantle
+                     endpoint. Backend module not built yet — entries stay
+                     disabled (design doc §2.4).
 
 The frontier models below all resolve through Bedrock on a single AWS key, so
 the catalog's aspirational self-hosted tiers (glm-5.2, deepseek-v4-*) can be
@@ -26,9 +30,83 @@ same product, cheaper backend until the economics justify self-hosting.
 
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-Backend = Literal["runner", "openai_compat", "bedrock"]
+Backend = Literal["runner", "openai_compat", "bedrock", "bedrock_mantle"]
+
+
+class Profile(BaseModel):
+    """Concrete inference params for one named profile (fast|balanced|deep).
+
+    effort: reasoning-effort level passed to the model (Anthropic/Bedrock
+      low|medium|high|xhigh|max; OpenAI Responses minimal|low|medium|high), or
+      None when the model has no effort control (the gateway omits it).
+    max_tokens: output-token ceiling for this profile (thinking shares it).
+    """
+
+    effort: str | None = None
+    max_tokens: int = 4096
+
+
+class InferenceDefaults(BaseModel):
+    """Per-model inference policy the gateway enforces (param unification).
+
+    Single source of truth for how each model is asked to think and sample, so
+    the whole fleet inherits consistent, *valid* settings (every request funnels
+    through the gateway). See oasis-x/.swarm/GENERATIVE_BEDROCK_INFERENCE_DESIGN.md.
+
+    thinking:
+      "adaptive"  — adaptive-thinking Claude (Opus 4.8, Sonnet 5): the gateway
+                    sends thinking={"type":"adaptive"} + output_config.effort.
+      "off"/"native" — no thinking field injected (native = intrinsic to the
+                    engine, e.g. runner GGUFs or probe-pending Bedrock opens).
+      "always_on" — thinking cannot be disabled (reserved; no roster model today).
+    allow_temperature / allow_sampling:
+      False strips temperature / top_p before the call. The adaptive-Claude
+      removed-set (opus-4.8, sonnet-5) 400s on `temperature` (verified live
+      2026-07-24); Anthropic also rejects sampling params while thinking is on.
+    profiles / default_profile:
+      fast|balanced|deep -> Profile. default_profile is applied when the caller
+      sends neither a `profile` nor an explicit `reasoning_effort`.
+    """
+
+    thinking: Literal["off", "adaptive", "native", "always_on"] = "native"
+    allow_temperature: bool = True
+    allow_sampling: bool = True
+    default_profile: str = "balanced"
+    profiles: dict[str, Profile] = Field(default_factory=dict)
+
+
+def _adaptive_claude(deep_effort: str = "xhigh") -> InferenceDefaults:
+    """Inference policy for adaptive-thinking Claude on Bedrock (Opus 4.8,
+    Sonnet 5). Temperature/sampling stripped — the removed-set 400s on them
+    (verified live 2026-07-24)."""
+    return InferenceDefaults(
+        thinking="adaptive",
+        allow_temperature=False,
+        allow_sampling=False,
+        default_profile="balanced",
+        profiles={
+            "fast": Profile(effort="low", max_tokens=4096),
+            "balanced": Profile(effort="high", max_tokens=16000),
+            "deep": Profile(effort=deep_effort, max_tokens=32000),
+        },
+    )
+
+
+def _native_thinking(fast: int = 4096, balanced: int = 8192, deep: int = 16000) -> InferenceDefaults:
+    """Inference policy for models whose thinking is intrinsic / not yet
+    gateway-controllable (runner GGUFs, probe-pending Bedrock opens like GLM-5).
+    No thinking/effort injected; only max_tokens is set per profile."""
+    return InferenceDefaults(
+        thinking="native",
+        default_profile="balanced",
+        profiles={
+            "fast": Profile(max_tokens=fast),
+            "balanced": Profile(max_tokens=balanced),
+            "deep": Profile(max_tokens=deep),
+        },
+    )
 
 
 class CatalogEntry(BaseModel):
@@ -37,9 +115,12 @@ class CatalogEntry(BaseModel):
     tier: str
     enabled: bool
     backend: Backend = "runner"
-    # openai_compat only: where to forward and which env var holds the bearer key.
+    # openai_compat / bedrock_mantle only: where to forward and which env var holds the bearer key.
     base_url: str | None = None
     api_key_env: str | None = None
+    # Per-model inference policy (thinking/effort/temperature/profiles). None =
+    # legacy passthrough (no gateway-side param injection).
+    inference: InferenceDefaults | None = None
     notes: str = ""
 
 
@@ -84,7 +165,7 @@ CATALOG: list[CatalogEntry] = [
         tier="L",
         enabled=False,
         notes="284B/13B-active MoE, MIT. Awaits 4-8x H100-SXM runner. "
-        "Served now via `deepseek-v3.2` on Bedrock (see below).",
+        "(Bedrock deepseek-v3.2 stand-in removed 2026-07-24 in the roster trim.)",
     ),
     CatalogEntry(
         public_id="glm-5.2",
@@ -102,42 +183,32 @@ CATALOG: list[CatalogEntry] = [
         notes="1.6T/49B-active MoE, MIT. Reserve-on-wake only.",
     ),
     # ---- Bedrock passthrough (bedrock backend, GEN-003) --------------------
-    # All resolve through the single oasis-dev AWS key (us-east-1 inference
-    # profiles). IDs verified live 2026-07-15 via `aws bedrock
-    # list-inference-profiles` / `list-foundation-models`.
-    CatalogEntry(
-        public_id="claude-sonnet-4-6",
-        upstream_id="us.anthropic.claude-sonnet-4-6",
-        tier="bedrock",
-        enabled=True,
-        backend="bedrock",
-        notes="Anthropic Claude Sonnet 4.6 via Bedrock. Second Claude route (billed to the "
-        "oasis-dev account) — a cross-provider failover for the direct Anthropic key.",
-    ),
+    # Frontier models on the single oasis-dev AWS key (us-east-1 inference
+    # profiles; IDs verified live 2026-07-24 via `aws bedrock
+    # list-inference-profiles`). Roster trimmed 2026-07-24 (design doc §0.1):
+    # removed Sonnet 4.6, Haiku 4.5, gpt-oss-120b, deepseek-v3.2, llama-4-maverick;
+    # Fable 5 not added (data-retention refusal + cost). Per-model inference
+    # policy (thinking/effort/temperature) lives in the `inference` blocks.
     CatalogEntry(
         public_id="claude-opus-4-8",
         upstream_id="us.anthropic.claude-opus-4-8",
         tier="bedrock",
         enabled=True,
         backend="bedrock",
-        notes="Anthropic Claude Opus 4.8 via Bedrock.",
+        inference=_adaptive_claude("xhigh"),
+        notes="Anthropic Claude Opus 4.8 via Bedrock. Adaptive thinking; effort "
+        "fast=low / balanced=high / deep=xhigh; temperature removed (400s, verified 2026-07-24).",
     ),
     CatalogEntry(
-        public_id="claude-haiku-4-5",
-        upstream_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        public_id="claude-sonnet-5",
+        upstream_id="us.anthropic.claude-sonnet-5",
         tier="bedrock",
         enabled=True,
         backend="bedrock",
-        notes="Anthropic Claude Haiku 4.5 via Bedrock — cheap/fast tier.",
-    ),
-    CatalogEntry(
-        public_id="gpt-oss-120b",
-        upstream_id="openai.gpt-oss-120b-1:0",
-        tier="bedrock",
-        enabled=True,
-        backend="bedrock",
-        notes="OpenAI GPT-OSS 120B (open weights) via Bedrock. Real GPT-5 would need the "
-        "OpenAI API via an openai_compat entry; gpt-oss keeps everything on oasis-dev.",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Sonnet 5 via Bedrock (added 2026-07-24). Adaptive thinking; "
+        "deep effort capped at high; ~30% heavier tokenizer, hence the roomier max_tokens. "
+        "Temperature removed (400s).",
     ),
     CatalogEntry(
         public_id="glm-5",
@@ -145,23 +216,36 @@ CATALOG: list[CatalogEntry] = [
         tier="bedrock",
         enabled=True,
         backend="bedrock",
-        notes="Z.AI GLM-5 via Bedrock. Immediate stand-in for the self-hosted glm-5.2 tier.",
+        inference=_native_thinking(),
+        notes="Z.AI GLM-5 via Bedrock. Kept 2026-07-24 as the interim stand-in for the "
+        "self-hosted glm-5.2 tier. Thinking left native (no adaptive/effort injection) "
+        "pending a capability probe of its Bedrock reasoning support.",
     ),
+    # ---- Bedrock-mantle / OpenAI Responses (bedrock_mantle backend) --------
+    # GPT-5.6-sol is served ONLY on the bedrock-mantle endpoint via the OpenAI
+    # Responses API (NOT Converse/Chat-Completions) — design doc §2.4. DISABLED
+    # until the responses/mantle backend module lands (separate GEN slice);
+    # resolve() skips it so it 404s rather than mis-routing to Converse.
     CatalogEntry(
-        public_id="deepseek-v3.2",
-        upstream_id="deepseek.v3.2",
+        public_id="gpt-5.6-sol",
+        upstream_id="openai.gpt-5.6-sol",
         tier="bedrock",
-        enabled=True,
-        backend="bedrock",
-        notes="DeepSeek V3.2 via Bedrock. Immediate stand-in for the self-hosted deepseek-v4 tiers.",
-    ),
-    CatalogEntry(
-        public_id="llama-4-maverick",
-        upstream_id="us.meta.llama4-maverick-17b-instruct-v1:0",
-        tier="bedrock",
-        enabled=True,
-        backend="bedrock",
-        notes="Meta Llama 4 Maverick 17B via Bedrock.",
+        enabled=False,
+        backend="bedrock_mantle",
+        base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+        inference=InferenceDefaults(
+            thinking="native",
+            allow_temperature=False,
+            default_profile="balanced",
+            profiles={
+                "fast": Profile(effort="minimal", max_tokens=4096),
+                "balanced": Profile(effort="medium", max_tokens=16000),
+                "deep": Profile(effort="high", max_tokens=32000),
+            },
+        ),
+        notes="OpenAI GPT-5.6-sol via bedrock-mantle Responses API. Params: reasoning.effort "
+        "(minimal/medium/high) + max_output_tokens + verbosity; no temperature. Needs the "
+        "responses backend (separate slice); enabled=False until then.",
     ),
     # ---- Direct OpenAI-compatible providers (openai_compat backend) --------
     # Template, disabled: enable + set the api_key_env var to route real GPT
@@ -202,9 +286,9 @@ CATALOG: list[CatalogEntry] = [
     # Anthropic: deliberately NOT added as an openai_compat entry. Its native API
     # is the Messages API, not OpenAI chat-completions, so this backend's
     # {base_url}/chat/completions + Bearer shape does not apply as-is. Claude is
-    # ALREADY behind this gateway via the three `bedrock` entries above
-    # (sonnet-4-6 / opus-4-8 / haiku-4-5), which is the recommended route for the
-    # consolidation. If a direct (non-Bedrock-billed) Anthropic route is ever
+    # ALREADY behind this gateway via the `bedrock` entries above (opus-4-8 /
+    # sonnet-5), which is the recommended route for the consolidation. If a direct
+    # (non-Bedrock-billed) Anthropic route is ever
     # wanted, it needs either Anthropic's OpenAI-compat surface (verify it against
     # current Anthropic docs first) or a small `anthropic` backend module mirroring
     # bedrock.py — do not assume this backend will just work.

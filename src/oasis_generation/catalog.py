@@ -123,6 +123,51 @@ class CatalogEntry(BaseModel):
     inference: InferenceDefaults | None = None
     notes: str = ""
 
+    def capabilities(self) -> dict:
+        """Per-model capability descriptor surfaced on /v1/models (design §7.7).
+
+        Drives the Telegram /genconfig surface, which renders ONLY the controls a
+        model actually supports — so a temperature slider never appears for a
+        model that 400s on it, effort is hidden where it has no effect, etc.
+        Derived entirely from the `inference` policy so one catalog edit
+        propagates to the UI. `inference=None` -> a permissive legacy descriptor.
+        """
+        inf = self.inference
+        if inf is None:
+            return {
+                "supports_thinking": False,
+                "thinking_forced": False,
+                "supports_effort": False,
+                "effort_levels": [],
+                "supports_temperature": True,
+                "supports_sampling": True,
+                "max_output_tokens_ceiling": None,
+                "profiles": [],
+                "default_profile": None,
+            }
+        thinking_on = inf.thinking in ("adaptive", "always_on")
+        # Effort choices, in profile order (fast->balanced->deep), deduped.
+        effort_levels: list[str] = []
+        for prof in inf.profiles.values():
+            if prof.effort and prof.effort not in effort_levels:
+                effort_levels.append(prof.effort)
+        ceilings = [prof.max_tokens for prof in inf.profiles.values()]
+        return {
+            # Gateway-controllable extended thinking (adaptive). Native thinking
+            # (intrinsic to the engine) is not exposed as a user control.
+            "supports_thinking": inf.thinking == "adaptive",
+            "thinking_forced": inf.thinking == "always_on",
+            "supports_effort": thinking_on and bool(effort_levels),
+            "effort_levels": effort_levels,
+            # Temperature only if the model allows it AND thinking isn't forced/adaptive
+            # (the gateway strips it in those cases, so the control would be a no-op).
+            "supports_temperature": inf.allow_temperature and not thinking_on,
+            "supports_sampling": inf.allow_sampling and not thinking_on,
+            "max_output_tokens_ceiling": max(ceilings) if ceilings else None,
+            "profiles": list(inf.profiles.keys()),
+            "default_profile": inf.default_profile,
+        }
+
 
 CATALOG: list[CatalogEntry] = [
     # ---- Self-hosted tiers (runner backend) --------------------------------
@@ -139,6 +184,9 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-coder-fable5-composer2.5-v1-gguf:Q4_K_M",
         tier="S",
         enabled=True,
+        # Local llama.cpp: thinking is intrinsic (not gateway-controllable); the
+        # profiles advertise max_tokens for the UI (small — 36GB-Mac / OOM cap).
+        inference=_native_thinking(2048, 4096, 8192),
         notes="Community distill (Composer 2.5 + Fable 5 traces). GEN-002 pass 2026-07-12: "
         "cleared for personal/fleet use; customer tier still blocked. "
         "Pinned HF rev 1380be1796e559fca96b4107599285cab3ddbb92.",
@@ -148,6 +196,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-agentic-fable5-composer2.5-v2-3.5x-tau2-gguf:Q4_K_M",
         tier="S",
         enabled=True,
+        inference=_native_thinking(2048, 4096, 8192),
         notes="Community distill, tau2-telecom ~55% vs ~15% base (author-run). GEN-002 pass "
         "2026-07-12 incl. exfil-via-tool-injection probe: cleared for personal/fleet use; "
         "customer tier still blocked. Pinned HF rev 190a31365a6b80a692349be34ccdac730cad4fe4.",

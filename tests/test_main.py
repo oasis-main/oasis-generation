@@ -41,6 +41,29 @@ def test_models_lists_only_enabled():
     assert "gpt-5.6-sol" not in ids    # bedrock_mantle backend not built yet
 
 
+def test_models_expose_capability_descriptors():
+    data = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    # Adaptive Claude: thinking + effort controllable, temperature hidden.
+    opus = data["claude-opus-4-8"]["capabilities"]
+    assert opus["supports_thinking"] is True
+    assert opus["supports_effort"] is True
+    assert opus["effort_levels"] == ["low", "high", "xhigh"]  # fast/balanced/deep order
+    assert opus["supports_temperature"] is False
+    assert opus["max_output_tokens_ceiling"] == 32000
+    assert opus["profiles"] == ["fast", "balanced", "deep"]
+    assert opus["default_profile"] == "balanced"
+    # Native model (GLM-5): no gateway thinking control, temperature allowed.
+    glm = data["glm-5"]["capabilities"]
+    assert glm["supports_thinking"] is False
+    assert glm["supports_effort"] is False
+    assert glm["supports_temperature"] is True
+    assert glm["effort_levels"] == []
+    # Local Gemma: native, small ceiling.
+    gemma = data["gemma-4-12b-coder"]["capabilities"]
+    assert gemma["supports_thinking"] is False
+    assert gemma["max_output_tokens_ceiling"] == 8192
+
+
 def test_unknown_model_404s():
     resp = client.post("/v1/chat/completions", json={"model": "nope", "messages": []})
     assert resp.status_code == 404

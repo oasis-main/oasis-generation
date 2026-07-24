@@ -42,10 +42,19 @@ def health() -> dict:
 
 @app.get("/v1/models", dependencies=[Depends(check_auth)])
 def list_models() -> dict:
+    # `capabilities` is an oasis-generation extension to the OpenAI model object
+    # (standard clients ignore unknown fields); it drives the Telegram /genconfig
+    # surface so each model shows only the controls it actually supports (§7.7).
     return {
         "object": "list",
         "data": [
-            {"id": m.public_id, "object": "model", "owned_by": "oasis-generation", "tier": m.tier}
+            {
+                "id": m.public_id,
+                "object": "model",
+                "owned_by": "oasis-generation",
+                "tier": m.tier,
+                "capabilities": m.capabilities(),
+            }
             for m in enabled_models()
         ],
     }

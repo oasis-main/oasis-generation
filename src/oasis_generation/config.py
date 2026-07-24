@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # a cold or busy runner can be slow; keep this generous.
     upstream_timeout_s: float = 300.0
 
+    # AWS region for the Bedrock backend (GEN-003). Bedrock credentials come
+    # from the AWS SDK default chain (env keys / profile / role) — the gateway
+    # holds them, the bots never do.
+    bedrock_region: str = "us-east-1"
+
     model_config = {"env_prefix": "OASIS_GENERATION_"}
 
     @property

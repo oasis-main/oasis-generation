@@ -9,6 +9,9 @@ dependencies = [
   "pydantic>=2.9",
   "pydantic-settings>=2.4",
   "httpx>=0.27",
+  # Bedrock backend (GEN-003 provider fanout). Pure-Python; keeps the gateway
+  # CPU-slim (no torch/CUDA — that stays in the runner-vllm extra).
+  "boto3>=1.35",
 ]
 
 # The gateway stays CPU-slim; the GPU serving stack is an extra so the

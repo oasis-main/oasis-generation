@@ -25,6 +25,30 @@ Terraform-first-class stop/start), Nebius fallback (H200 tier). Weights live
 on persistent block volumes, never in images and never on scratch NVMe
 (erased on full stop).
 
+## Proxied frontier models (Bedrock — GEN-003)
+
+The gateway also fronts Amazon Bedrock via the Converse API, so the whole fleet
+reaches frontier models through one AWS key (oasis-dev, `us-east-1`) — the bots
+never hold a provider key, and egress collapses to gateway + Telegram. This also
+means the aspirational self-hosted tiers above (`glm-5.2`, `deepseek-v4-*`) are
+usable **now** via proxying, with the owned-runner path as the future scale-up.
+
+| Public id | Bedrock model / inference profile |
+|-----------|-----------------------------------|
+| `claude-sonnet-4-6` | `us.anthropic.claude-sonnet-4-6` |
+| `claude-opus-4-8` | `us.anthropic.claude-opus-4-8` |
+| `claude-haiku-4-5` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `gpt-oss-120b` | `openai.gpt-oss-120b-1:0` |
+| `glm-5` | `zai.glm-5` |
+| `deepseek-v3.2` | `deepseek.v3.2` |
+| `llama-4-maverick` | `us.meta.llama4-maverick-17b-instruct-v1:0` |
+
+Auth is the AWS SDK default chain — set `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+(+ `AWS_REGION`) on the gateway (see `docker/.env.example`). Direct
+OpenAI-compatible providers (real GPT, direct DeepSeek/Zhipu, …) are supported
+too via `openai_compat` catalog entries; the `gpt-5` entry is a disabled
+template.
+
 ## Local development
 
 The gateway proxies to Docker Model Runner, so the full API shape runs on a

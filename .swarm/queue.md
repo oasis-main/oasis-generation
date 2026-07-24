@@ -56,7 +56,7 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
                4. If cleared: flip enabled=true in catalog.py, pin
                   upstream_id to @<revision>.
 
-- [ ] [GEN-003] [OPEN] Gateway v0 hardening: streaming, provider fanout, per-bot service tokens
+- [/] [GEN-003] [IN PROGRESS] Gateway v0 hardening: streaming, provider fanout, per-bot service tokens
       priority: high | project: gateway | division: GEN
       notes: Current main.py is a single-upstream proxy. Add: SSE streaming
              pass-through test against live DMR; provider fanout (Anthropic/
@@ -64,6 +64,24 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              the gateway (see memory note interlocks — egress allowlist
              narrows to gateway + Telegram); per-bot tokens with per-token
              rate/spend caps; structured usage events for metering.
+      DONE 2026-07-15 — provider fanout via Bedrock (Converse, direct boto3;
+             chosen over LiteLLM for robustness with brand-new 2026 model ids).
+             catalog.py grew a `backend` field (runner | openai_compat |
+             bedrock); bedrock.py does OpenAI<->Converse (non-stream + SSE,
+             reasoning_content + cache-token passthrough). Enabled: claude
+             sonnet-4-6 / opus-4-8 / haiku-4-5, gpt-oss-120b, glm-5,
+             deepseek-v3.2, llama-4-maverick — all on the oasis-dev key
+             (us-east-1 inference profiles; IDs verified live). Creds via the
+             gateway's env_file (docker/.env.example); bots hold nothing.
+             Verified end-to-end (non-stream + stream + glm-5) 2026-07-15;
+             12 tests green (6 bedrock translation + routing).
+      STILL OPEN: per-bot service tokens with rate/spend caps; structured usage
+             events for metering (ties to oasis-gateway-billing); openai_compat
+             enablement for real GPT if wanted. FOLLOW-ON (oasis-claw repo):
+             add these model ids to the bots' `oasis-generation` provider
+             catalog with correct context windows (Claude=200K, not 32K) and,
+             if desired, put `oasis-generation/claude-sonnet-4-6` in Nimbus's
+             fallback chain as a personal-billed Claude route.
 
 - [ ] [GEN-004] [OPEN] Wake/sleep controller + oasis-ai control-plane integration
       priority: medium | project: infra | division: GEN

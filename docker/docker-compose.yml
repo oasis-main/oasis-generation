@@ -18,9 +18,19 @@ services:
     memswap_limit: 512m
     ports:
       - "8800:8800"
+    # Secrets (service tokens + the Bedrock/oasis-dev AWS key) come from
+    # docker/.env via env_file — NOT `environment: ${VAR:-}` interpolation,
+    # which lets an empty shell export silently shadow the file (the mistake
+    # oasis-claw hit with Anthropic auth). env_file always wins.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Non-secret knobs only.
       OASIS_GENERATION_UPSTREAM_BASE_URL: ${OASIS_GENERATION_UPSTREAM_BASE_URL:-http://model-runner.docker.internal/engines/llama.cpp/v1}
-      OASIS_GENERATION_SERVICE_TOKENS: ${OASIS_GENERATION_SERVICE_TOKENS:-}
+      # Bedrock backend (GEN-003). Credentials themselves come from env_file
+      # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY); this is just the region.
+      OASIS_GENERATION_BEDROCK_REGION: ${OASIS_GENERATION_BEDROCK_REGION:-us-east-1}
 
   runner:
     profiles: ["gpu"]

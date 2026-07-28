@@ -15,8 +15,10 @@ interlock (bot egress collapses to gateway + Telegram).
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -107,8 +109,9 @@ def _client(region: str):
 def _content_to_text(content: Any) -> str:
     """Flatten OpenAI message content (str | list of parts) to plain text.
 
-    v0 is text-only: image/audio parts are dropped (Converse multimodal is a
-    later extension). Reasoning is handled on the response side, not here.
+    Text-only projection (image parts dropped). Used for system messages and
+    tool results; user turns go through `_content_to_converse_blocks`, which
+    keeps images. Reasoning is handled on the response side, not here.
     """
     if isinstance(content, str):
         return content
@@ -121,6 +124,73 @@ def _content_to_text(content: Any) -> str:
                 out.append(part)
         return "".join(out)
     return "" if content is None else str(content)
+
+
+# data:image/<fmt>;base64,<data>  — the self-contained image form (no fetch).
+_DATA_URI_RE = re.compile(r"^data:image/(png|jpe?g|gif|webp);base64,(.+)$", re.IGNORECASE | re.DOTALL)
+
+
+def _image_block(image_url: Any) -> dict | None:
+    """OpenAI image_url -> Converse image content block, or None if unusable.
+
+    Converse needs raw bytes, so only self-contained **data: URIs** are supported
+    (decoded here, no network). Remote http(s) URLs are NOT fetched — that would
+    add an SSRF surface on the gateway; supporting them (with egress guards) is a
+    follow-up. mantle/Responses models handle remote URLs upstream instead.
+    """
+    if not isinstance(image_url, str):
+        return None
+    m = _DATA_URI_RE.match(image_url.strip())
+    if not m:
+        return None
+    fmt = m.group(1).lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    try:
+        raw = base64.b64decode(m.group(2), validate=True)
+    except (ValueError, Exception):  # noqa: BLE001 — malformed base64 must not crash a request
+        return None
+    if not raw:
+        return None
+    return {"image": {"format": fmt, "source": {"bytes": raw}}}
+
+
+def _content_to_converse_blocks(content: Any) -> list[dict]:
+    """OpenAI message content (str | list) -> Converse content blocks (text +
+    images). Used for user turns so vision-capable models (Claude) receive images.
+    Consecutive text parts are merged into one block (preserving order around images)."""
+    if isinstance(content, str):
+        return [{"text": content}] if content else []
+    if not isinstance(content, list):
+        return [] if content is None else [{"text": str(content)}]
+
+    blocks: list[dict] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            joined = "".join(buf)
+            buf.clear()
+            if joined:
+                blocks.append({"text": joined})
+
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                buf.append(part)
+        elif isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype in (None, "text") and part.get("text"):
+                buf.append(str(part["text"]))
+            elif ptype == "image_url":
+                iu = part.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                block = _image_block(url)
+                if block:
+                    flush()  # keep any preceding text before the image, in order
+                    blocks.append(block)
+    flush()
+    return blocks
 
 
 def _parse_tool_args(raw: Any) -> dict:
@@ -222,9 +292,8 @@ def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
                 }
             )
         return "assistant", blocks
-    # user (and any other role) -> user text.
-    text = _content_to_text(msg.get("content"))
-    return "user", ([{"text": text}] if text else [])
+    # user (and any other role) -> user text + image blocks (vision-capable models).
+    return "user", _content_to_converse_blocks(msg.get("content"))
 
 
 def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) -> dict[str, Any]:

@@ -363,3 +363,40 @@ def test_no_inference_defaults_is_legacy_passthrough():
     assert "additionalModelRequestFields" not in kw
     assert kw["inferenceConfig"]["temperature"] == 0.5
     assert kw["inferenceConfig"]["maxTokens"] == bedrock._DEFAULT_MAX_TOKENS
+
+
+# ---- image input (Converse multimodal) --------------------------------------
+
+
+def test_image_data_uri_becomes_converse_image_block():
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}]}
+    blocks = bedrock.openai_to_converse(body)["messages"][0]["content"]
+    assert blocks[0] == {"text": "what is this?"}
+    assert blocks[1] == {"image": {"format": "png", "source": {"bytes": b"\x00\x00\x00"}}}
+
+
+def test_jpeg_and_bare_string_image_url():
+    # image_url as a bare string (not {"url":...}); jpg normalizes to jpeg.
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": "data:image/jpg;base64,AAAA"},
+    ]}]}
+    blocks = bedrock.openai_to_converse(body)["messages"][0]["content"]
+    assert blocks == [{"image": {"format": "jpeg", "source": {"bytes": b"\x00\x00\x00"}}}]
+
+
+def test_http_image_url_dropped_no_ssrf():
+    # Remote URLs are NOT fetched by the gateway (SSRF-safe) -> only text survives.
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+    ]}]}
+    assert bedrock.openai_to_converse(body)["messages"][0]["content"] == [{"text": "look"}]
+
+
+def test_malformed_or_missing_images_dropped():
+    assert bedrock._image_block("data:image/png;base64,!!!!") is None
+    assert bedrock._image_block("not a data uri") is None
+    assert bedrock._image_block(None) is None

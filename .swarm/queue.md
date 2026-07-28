@@ -88,11 +88,16 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              effort probe-pending). gpt-5.6-sol staged DISABLED as a new
              `bedrock_mantle` backend (OpenAI Responses endpoint — not built).
              23 tests green.
+      DONE 2026-07-24 (later same day) — capability descriptors on /v1/models
+             (design §7.7) + the `bedrock_mantle` backend for gpt-5.6-sol
+             (mantle.py: OpenAI chat-completions <-> Responses API on the
+             bedrock-mantle endpoint, SigV4 auth verified live, store=False,
+             text-first). gpt-5.6-sol enabled. Verified end-to-end live
+             (non-stream + fake-stream). 31 tests green.
       STILL OPEN: per-bot service tokens with rate/spend caps; structured usage
-             events for metering (ties to oasis-gateway-billing); the
-             `bedrock_mantle`/Responses backend for gpt-5.6-sol; /v1/models
-             capability descriptors (design §7.7) for the Telegram /genconfig
-             surface; GLM-5 reasoning capability probe. FOLLOW-ON (oasis-claw
+             events for metering (ties to oasis-gateway-billing); mantle
+             tool-calls + true token streaming (v0 is text-first / fake-stream);
+             GLM-5 reasoning capability probe. FOLLOW-ON (oasis-claw
              repo): the durable entrypoint still registers the OLD 9-model
              roster (incl. the 5 removed here) + a fallback chain referencing
              oasis-generation/claude-sonnet-4-6 — update it to the trimmed

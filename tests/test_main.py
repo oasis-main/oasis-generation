@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from oasis_generation import bedrock
+from oasis_generation import bedrock, mantle
 from oasis_generation.config import get_settings
 from oasis_generation.main import app
 
@@ -36,9 +36,10 @@ def test_models_lists_only_enabled():
     for removed in ("claude-sonnet-4-6", "claude-haiku-4-5", "gpt-oss-120b",
                     "deepseek-v3.2", "llama-4-maverick"):
         assert removed not in ids
-    # Disabled templates/placeholders stay hidden.
-    assert "gpt-5" not in ids          # openai_compat template, no key
-    assert "gpt-5.6-sol" not in ids    # bedrock_mantle backend not built yet
+    # GPT-5.6-sol is live via the bedrock_mantle (Responses) backend.
+    assert "gpt-5.6-sol" in ids
+    # The openai_compat template stays disabled until a key is provided.
+    assert "gpt-5" not in ids
 
 
 def test_models_expose_capability_descriptors():
@@ -107,6 +108,30 @@ def test_bedrock_route_returns_openai_shape(monkeypatch):
     assert amrf.get("output_config") == {"effort": "high"}  # balanced default
     assert "temperature" not in fake.seen["inferenceConfig"]
     assert fake.seen["inferenceConfig"]["maxTokens"] == 16000  # balanced profile
+
+
+def test_mantle_route_returns_openai_shape(monkeypatch):
+    async def fake_complete(model_id, body, region, public_id, defaults=None):
+        assert model_id == "openai.gpt-5.6-sol"
+        assert public_id == "gpt-5.6-sol"
+        return {
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": public_id,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(mantle, "complete", fake_complete)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["model"] == "gpt-5.6-sol"
+    assert data["choices"][0]["message"]["content"] == "pong"
 
 
 def test_openai_compat_missing_key_502(monkeypatch):

@@ -279,22 +279,25 @@ CATALOG: list[CatalogEntry] = [
         public_id="gpt-5.6-sol",
         upstream_id="openai.gpt-5.6-sol",
         tier="bedrock",
-        enabled=False,
+        enabled=True,
         backend="bedrock_mantle",
         base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
         inference=InferenceDefaults(
-            thinking="native",
+            # Reasoning is intrinsic; effort dials it. Ladder verified live
+            # 2026-07-24: none/low/medium/high/xhigh (NOT "minimal").
+            thinking="always_on",
             allow_temperature=False,
             default_profile="balanced",
             profiles={
-                "fast": Profile(effort="minimal", max_tokens=4096),
+                "fast": Profile(effort="low", max_tokens=4096),
                 "balanced": Profile(effort="medium", max_tokens=16000),
                 "deep": Profile(effort="high", max_tokens=32000),
             },
         ),
-        notes="OpenAI GPT-5.6-sol via bedrock-mantle Responses API. Params: reasoning.effort "
-        "(minimal/medium/high) + max_output_tokens + verbosity; no temperature. Needs the "
-        "responses backend (separate slice); enabled=False until then.",
+        notes="OpenAI GPT-5.6-sol via the bedrock-mantle Responses API (backend: mantle.py, "
+        "SigV4 auth verified live 2026-07-24). 272K ctx; profile -> reasoning.effort "
+        "(low/medium/high) + max_output_tokens + text.verbosity; no temperature. store=False. "
+        "v0 text-first (tool-calls + true streaming are follow-ups).",
     ),
     # ---- Direct OpenAI-compatible providers (openai_compat backend) --------
     # Template, disabled: enable + set the api_key_env var to route real GPT

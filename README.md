@@ -45,8 +45,15 @@ Each model carries an `inference` policy (thinking/effort/temperature + `fast`/
 `balanced`/`deep` profiles) the gateway enforces, so the fleet inherits consistent,
 valid settings — callers select a profile (`"profile": "deep"`) or override effort
 (`reasoning_effort`) / `max_tokens`, and invalid combos (e.g. temperature on the
-removed-set) are stripped. `GPT-5.6-sol` is staged as a disabled `bedrock_mantle`
-entry (OpenAI Responses API endpoint — needs a separate backend module).
+removed-set) are stripped.
+
+`gpt-5.6-sol` (OpenAI GPT-5.6-sol) is served through the **`bedrock_mantle`** backend
+(`mantle.py`) — the OpenAI **Responses API** on the bedrock-mantle endpoint
+(`https://bedrock-mantle.{region}.api.aws/openai/v1/responses`), SigV4-signed with the
+same AWS credential chain (no separate key). The gateway translates chat-completions
+&lt;-&gt; Responses; `store=False` (prompts not persisted); profile → `reasoning.effort`
+(low/medium/high) + `text.verbosity` + `max_output_tokens`. v0 is text-first (tool-calls
+and true token streaming are follow-ups).
 
 Auth is the AWS SDK default chain — set `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
 (+ `AWS_REGION`) on the gateway (see `docker/.env.example`). Direct

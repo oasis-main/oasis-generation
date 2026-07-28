@@ -9,9 +9,15 @@ Auth is SigV4 (service "bedrock") with the gateway's AWS credential chain —
 verified live 2026-07-24; no separate Bedrock API key is needed. Endpoint:
   https://bedrock-mantle.{region}.api.aws/openai/v1/responses
 
-v0 is text-first: system/user/assistant turns translate; tool-calling and true
-token streaming are follow-ups (see notes). `store` is forced False so prompts
-and responses are not persisted by the platform.
+Full modality (all verified live 2026-07-24):
+  - text: system -> instructions; user/assistant -> input message items.
+  - images: OpenAI image_url content parts -> Responses `input_image`.
+  - tools: OpenAI `tools`/`tool_choice` -> Responses FLAT function tools
+    ({type,name,parameters}); assistant tool_calls -> `function_call` items;
+    role "tool" results -> `function_call_output` items; response `function_call`
+    output -> OpenAI tool_calls.
+`store` is forced False so prompts/responses are not persisted by the platform.
+Streaming is a single-chunk fake-stream (true token streaming is a follow-up).
 """
 
 from __future__ import annotations
@@ -72,34 +78,127 @@ def _sign(url: str, data: str, region: str) -> dict[str, str]:
     return dict(req.headers)
 
 
+def _to_input_content(content: Any, role: str) -> list[dict]:
+    """OpenAI message content (str | list of parts) -> Responses content parts.
+
+    Text -> input_text (user) / output_text (assistant); OpenAI image_url parts
+    (either {"url": ...} or a bare string) -> Responses `input_image`.
+    """
+    text_type = "output_text" if role == "assistant" else "input_text"
+    parts: list[dict] = []
+    if isinstance(content, str):
+        if content:
+            parts.append({"type": text_type, "text": content})
+        return parts
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, str):
+                if p:
+                    parts.append({"type": text_type, "text": p})
+                continue
+            if not isinstance(p, dict):
+                continue
+            ptype = p.get("type")
+            if ptype in (None, "text", "input_text", "output_text") and p.get("text"):
+                parts.append({"type": text_type, "text": str(p["text"])})
+            elif ptype == "image_url":
+                iu = p.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
+                if url:
+                    parts.append({"type": "input_image", "image_url": url})
+            elif ptype == "input_image" and p.get("image_url"):
+                parts.append({"type": "input_image", "image_url": p["image_url"]})
+    return parts
+
+
+def _tools_to_responses(body: dict) -> list[dict] | None:
+    """OpenAI `tools` -> Responses FLAT function tools ({type,name,parameters}).
+    tool_choice=="none" drops tools entirely (the cross-model-safe way to disable)."""
+    tools = body.get("tools")
+    if not tools or body.get("tool_choice") == "none":
+        return None
+    specs: list[dict] = []
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        fn = t.get("function") or {}
+        name = fn.get("name")
+        if not name:
+            continue
+        spec: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if fn.get("description"):
+            spec["description"] = fn["description"]
+        specs.append(spec)
+    return specs or None
+
+
+def _tool_choice_to_responses(choice: Any) -> Any | None:
+    """OpenAI tool_choice -> Responses tool_choice ("auto"/"required" or
+    {type:function,name}). "none"/"auto"/None are handled by caller/default."""
+    if choice in ("auto", "required"):
+        return choice
+    if isinstance(choice, dict) and choice.get("type") == "function":
+        name = (choice.get("function") or {}).get("name")
+        if name:
+            return {"type": "function", "name": name}
+    return None
+
+
+def _tool_call_arguments(raw: Any) -> str:
+    """Responses `arguments` is a JSON string; tolerate an already-parsed dict."""
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw or {})
+
+
 def openai_to_responses(
     model_id: str, body: dict, defaults: "InferenceDefaults | None" = None
 ) -> dict[str, Any]:
     """OpenAI chat-completions body -> Bedrock-mantle Responses request.
 
-    System/developer messages fold into top-level `instructions`; user/assistant
-    turns become `input` message items (input_text / output_text parts). Inference
-    params come from the model's InferenceDefaults/profile (effort -> reasoning.effort,
-    profile -> text.verbosity, max_tokens -> max_output_tokens). `store` is False.
+    System/developer -> `instructions`; user/assistant -> `input` message items
+    (text + images); assistant `tool_calls` -> `function_call` items; role "tool"
+    -> `function_call_output`; OpenAI `tools`/`tool_choice` -> Responses tools.
+    Inference params come from the model's InferenceDefaults/profile. `store` False.
     """
     instructions: list[str] = []
     items: list[dict] = []
     for msg in body.get("messages", []):
         role = msg.get("role")
-        text = _content_to_text(msg.get("content"))
         if role in ("system", "developer"):
+            text = _content_to_text(msg.get("content"))
             if text:
                 instructions.append(text)
             continue
         if role == "tool":
-            # Tool results are not translated in v0 (Responses uses a distinct
-            # function_call_output item shape) — see module notes.
+            items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id") or "",
+                # Converse rejects empty; keep a placeholder if the tool returned nothing.
+                "output": _content_to_text(msg.get("content")) or "(no content)",
+            })
             continue
-        if not text:
+        if role == "assistant":
+            content_parts = _to_input_content(msg.get("content"), "assistant")
+            if content_parts:
+                items.append({"type": "message", "role": "assistant", "content": content_parts})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id") or "",
+                    "name": fn.get("name") or "",
+                    "arguments": _tool_call_arguments(fn.get("arguments")),
+                })
             continue
-        conv_role = "assistant" if role == "assistant" else "user"
-        part_type = "output_text" if conv_role == "assistant" else "input_text"
-        items.append({"type": "message", "role": conv_role, "content": [{"type": part_type, "text": text}]})
+        # user (and any other role) -> a user message item.
+        content_parts = _to_input_content(msg.get("content"), "user")
+        if content_parts:
+            items.append({"type": "message", "role": "user", "content": content_parts})
 
     _thinking, effort, max_tokens, allow_temp, _allow_samp = _resolve_inference(body, defaults)
 
@@ -121,6 +220,12 @@ def openai_to_responses(
     # GPT-5.6-sol rejects temperature; only forwarded if the model's policy allows it.
     if body.get("temperature") is not None and allow_temp:
         payload["temperature"] = float(body["temperature"])
+    tools = _tools_to_responses(body)
+    if tools:
+        payload["tools"] = tools
+        choice = _tool_choice_to_responses(body.get("tool_choice"))
+        if choice is not None:
+            payload["tool_choice"] = choice
     return payload
 
 
@@ -132,14 +237,33 @@ def _finish_reason(resp: dict) -> str:
 
 
 def responses_to_openai(resp: dict, public_id: str, completion_id: str, created: int) -> dict:
-    """Bedrock-mantle Responses object -> OpenAI chat.completion."""
+    """Bedrock-mantle Responses object -> OpenAI chat.completion.
+
+    `message` output items -> assistant text; `function_call` items -> OpenAI
+    tool_calls (arguments already a JSON string). A tool-call turn sets content
+    null and finish_reason "tool_calls", per OpenAI convention.
+    """
     text_parts: list[str] = []
+    tool_calls: list[dict] = []
     for item in resp.get("output") or []:
-        if item.get("type") != "message":
-            continue
-        for part in item.get("content") or []:
-            if part.get("type") == "output_text":
-                text_parts.append(part.get("text") or "")
+        itype = item.get("type")
+        if itype == "message":
+            for part in item.get("content") or []:
+                if part.get("type") == "output_text":
+                    text_parts.append(part.get("text") or "")
+        elif itype == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or item.get("id") or "",
+                "type": "function",
+                "function": {
+                    "name": item.get("name") or "",
+                    "arguments": item.get("arguments") or "{}",
+                },
+            })
+    text = "".join(text_parts)
+    message: dict[str, Any] = {"role": "assistant", "content": text if text else (None if tool_calls else "")}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     usage = resp.get("usage") or {}
     return {
         "id": completion_id,
@@ -149,8 +273,8 @@ def responses_to_openai(resp: dict, public_id: str, completion_id: str, created:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "".join(text_parts)},
-                "finish_reason": _finish_reason(resp),
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else _finish_reason(resp),
             }
         ],
         "usage": {
@@ -186,13 +310,13 @@ async def stream(
     defaults: "InferenceDefaults | None" = None,
 ) -> AsyncIterator[bytes]:
     """v0 streaming: the Responses call is non-streaming, then the completed
-    answer is emitted as a single OpenAI SSE content chunk. True token streaming
-    (Responses SSE events -> OpenAI deltas) is a follow-up."""
+    answer (text and/or tool_calls) is emitted as OpenAI SSE chunks. True token
+    streaming (Responses SSE events -> OpenAI deltas) is a follow-up."""
     result = await complete(model_id, {**body, "stream": False}, region, public_id, defaults)
     cid = result["id"]
     created = result["created"]
     choice = result["choices"][0]
-    content = choice["message"]["content"]
+    message = choice["message"]
 
     def chunk(delta: dict, finish: str | None = None) -> dict:
         return {
@@ -204,7 +328,14 @@ async def stream(
         }
 
     yield _sse(chunk({"role": "assistant"}))
-    if content:
-        yield _sse(chunk({"content": content}))
+    if message.get("content"):
+        yield _sse(chunk({"content": message["content"]}))
+    for i, tc in enumerate(message.get("tool_calls") or []):
+        yield _sse(chunk({"tool_calls": [{
+            "index": i,
+            "id": tc["id"],
+            "type": "function",
+            "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
+        }]}))
     yield _sse(chunk({}, choice["finish_reason"]))
     yield b"data: [DONE]\n\n"

@@ -295,9 +295,10 @@ CATALOG: list[CatalogEntry] = [
             },
         ),
         notes="OpenAI GPT-5.6-sol via the bedrock-mantle Responses API (backend: mantle.py, "
-        "SigV4 auth verified live 2026-07-24). 272K ctx; profile -> reasoning.effort "
-        "(low/medium/high) + max_output_tokens + text.verbosity; no temperature. store=False. "
-        "v0 text-first (tool-calls + true streaming are follow-ups).",
+        "SigV4 auth verified live 2026-07-24). 272K ctx; text + images + tool-calling (all "
+        "verified live); profile -> reasoning.effort (low/medium/high) + max_output_tokens + "
+        "text.verbosity; no temperature. store=False. Streaming is a fake-stream (true token "
+        "streaming is a follow-up).",
     ),
     # ---- Direct OpenAI-compatible providers (openai_compat backend) --------
     # Template, disabled: enable + set the api_key_env var to route real GPT

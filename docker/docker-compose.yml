@@ -31,6 +31,19 @@ services:
       # Bedrock backend (GEN-003). Credentials themselves come from env_file
       # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY); this is just the region.
       OASIS_GENERATION_BEDROCK_REGION: ${OASIS_GENERATION_BEDROCK_REGION:-us-east-1}
+    # Dual-homed like the oasis-voice / oasis-semantics sidecars: the project
+    # `default` net keeps the gateway's own internet egress (Bedrock / mantle),
+    # while the fleet's `oasis_sandboxed` net lets the egress-LOCKED bots reach
+    # the gateway INTERNALLY by the `oasis-generation` alias (they set
+    # OASIS_GENERATION_URL=http://oasis-generation:8800/v1 + NO_PROXY it). This is
+    # the "egress collapses to gateway + Telegram" model: bots never touch the
+    # internet directly; the gateway makes the external calls. Nimbus (non-sandboxed)
+    # keeps using host.docker.internal:8800 via the published port below.
+    networks:
+      default: {}
+      oasis_sandboxed:
+        aliases:
+          - oasis-generation
 
   runner:
     profiles: ["gpu"]
@@ -46,3 +59,11 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+networks:
+  # The oasis-claw fleet's sandboxed network (created by that project). Declared
+  # external so the gateway can dual-home onto it without owning it; if the fleet
+  # isn't up, `docker compose up` will error until the network exists.
+  oasis_sandboxed:
+    external: true
+    name: oasis-claw_oasis_sandboxed

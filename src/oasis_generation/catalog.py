@@ -249,6 +249,21 @@ CATALOG: list[CatalogEntry] = [
         "fast=low / balanced=high / deep=xhigh; temperature removed (400s, verified 2026-07-24).",
     ),
     CatalogEntry(
+        public_id="claude-opus-5",
+        upstream_id="us.anthropic.claude-opus-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("xhigh"),
+        notes="Anthropic Claude Opus 5 via Bedrock (added 2026-08-24, ADM-048). Until "
+        "now Opus 5 was reachable ONLY by Nimbus, which carries a direct amazon-bedrock "
+        "provider on Mike's personal IAM key; the other six bots had no route to it at "
+        "all and `claude-opus-5` 404'd here. Serving it through the gateway puts every "
+        "bot on one metered path and off per-bot AWS credentials. Inference policy "
+        "mirrors Opus 4.8 (adaptive thinking, temperature removed). Upstream verified "
+        "live against Converse before this entry was added: HTTP 200, real token usage.",
+    ),
+    CatalogEntry(
         public_id="claude-sonnet-5",
         upstream_id="us.anthropic.claude-sonnet-5",
         tier="bedrock",

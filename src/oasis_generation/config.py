@@ -31,7 +31,42 @@ class Settings(BaseSettings):
 
     @property
     def tokens(self) -> set[str]:
-        return {t.strip() for t in self.service_tokens.split(",") if t.strip()}
+        return set(self.token_clients)
+
+    @property
+    def token_clients(self) -> dict[str, str]:
+        """Bearer token -> caller name.
+
+        Accepts two entry shapes in OASIS_GENERATION_SERVICE_TOKENS, comma
+        separated, so an existing deployment keeps working unchanged:
+
+          name:token   -> attributed to `name`
+          token        -> attributed to "unattributed"
+
+        WHY THIS EXISTS (ADM-050): until 2026-08-26 every bot in the fleet
+        presented the SAME token, so nothing anywhere could say which bot
+        caused which cost — not this gateway, and not Bedrock either, since
+        the gateway holds one AWS credential for all of them. A month in which
+        87.5% of spend came from a single model could not be pinned to a bot
+        without reading container logs by hand.
+
+        A token containing no colon is still accepted. Rejecting the old
+        single-token form would take the whole fleet offline on deploy, which
+        is a far worse outcome than degraded attribution.
+        """
+        out: dict[str, str] = {}
+        for raw in self.service_tokens.split(","):
+            item = raw.strip()
+            if not item:
+                continue
+            if ":" in item:
+                name, _, tok = item.partition(":")
+                name, tok = name.strip(), tok.strip()
+                if tok:
+                    out[tok] = name or "unattributed"
+            else:
+                out[item] = "unattributed"
+        return out
 
 
 @lru_cache

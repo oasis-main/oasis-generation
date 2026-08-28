@@ -39,6 +39,12 @@ services:
     # the "egress collapses to gateway + Telegram" model: bots never touch the
     # internet directly; the gateway makes the external calls. Nimbus (non-sandboxed)
     # keeps using host.docker.internal:8800 via the published port below.
+    # Per-request usage ledger (ADM-050). Host-side and gitignored: the
+    # container is recreated on every deploy, so an in-container path would
+    # lose the history the ledger exists to accumulate. Records who called
+    # which model — never prompt or completion content.
+    volumes:
+      - ../usage:/usage
     networks:
       default: {}
       oasis_sandboxed:

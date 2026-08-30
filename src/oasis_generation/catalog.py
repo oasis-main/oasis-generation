@@ -274,6 +274,63 @@ CATALOG: list[CatalogEntry] = [
         "deep effort capped at high; ~30% heavier tokenizer, hence the roomier max_tokens. "
         "Temperature removed (400s).",
     ),
+    # ---- Cheaper tier (ADM-052, added 2026-08-28) -------------------------
+    # Every entry below was probed live against this account BEFORE being
+    # enabled — see the analysis/ tooling. Two candidates were REJECTED and are
+    # deliberately absent rather than added-and-broken:
+    #   claude-fable-5 -> "data retention mode 'default' is not available for
+    #                      this model" (matches the pre-existing note that Fable
+    #                      was skipped for a data-retention refusal).
+    #   xai.grok-4.6   -> 404 on Converse; the inference profile is listed as
+    #                      ACTIVE but the model path is not enabled here.
+    CatalogEntry(
+        public_id="claude-haiku-4-5",
+        upstream_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        # NO adaptive-thinking block. Haiku 4.5 rejects it outright:
+        # "adaptive thinking is not supported on this model" (ValidationException,
+        # observed live 2026-08-28). A raw Converse probe SUCCEEDS on this model
+        # because it injects nothing — the failure only appears through the
+        # gateway, which is the reason new entries must be verified on the
+        # gateway path and not just against the AWS API.
+        notes="Anthropic Claude Haiku 4.5 via Bedrock. The cheap Claude — for "
+        "classification, routing, short replies and anything that does not need "
+        "Sonnet. Inference defaults left unset: this model takes no adaptive "
+        "thinking. Probed live 2026-08-28 through the gateway (HTTP 200).",
+    ),
+    CatalogEntry(
+        public_id="nova-2-lite",
+        upstream_id="us.amazon.nova-2-lite-v1:0",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        notes="Amazon Nova 2 Lite via Bedrock. Among the cheapest text models on "
+        "the account. No thinking/effort controls — inference defaults are left "
+        "unset on purpose so nothing is injected that the model does not accept. "
+        "Probed live 2026-08-28 (Converse, HTTP 200).",
+    ),
+    CatalogEntry(
+        public_id="nova-micro",
+        upstream_id="us.amazon.nova-micro-v1:0",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        notes="Amazon Nova Micro via Bedrock. Cheapest option here; text only, "
+        "small context. Intended for high-volume mechanical work where Sonnet is "
+        "pure waste. Probed live 2026-08-28 (Converse, HTTP 200).",
+    ),
+    CatalogEntry(
+        public_id="llama3-3-70b",
+        upstream_id="us.meta.llama3-3-70b-instruct-v1:0",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        notes="Meta Llama 3.3 70B Instruct via Bedrock. Cheap open-weight "
+        "general model; no adaptive thinking. Probed live 2026-08-28 (Converse, "
+        "HTTP 200).",
+    ),
     CatalogEntry(
         public_id="glm-5",
         upstream_id="zai.glm-5",
@@ -314,6 +371,54 @@ CATALOG: list[CatalogEntry] = [
         "verified live); profile -> reasoning.effort (low/medium/high) + max_output_tokens + "
         "text.verbosity; no temperature. store=False. Streaming is a fake-stream (true token "
         "streaming is a follow-up).",
+    ),
+    CatalogEntry(
+        public_id="gpt-5.6-luna",
+        upstream_id="openai.gpt-5.6-luna",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock_mantle",
+        base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+        inference=InferenceDefaults(
+            thinking="always_on",
+            allow_temperature=False,
+            default_profile="balanced",
+            profiles={
+                "fast": Profile(effort="low", max_tokens=4096),
+                "balanced": Profile(effort="medium", max_tokens=16000),
+                "deep": Profile(effort="high", max_tokens=32000),
+            },
+        ),
+        notes="OpenAI GPT-5.6-luna via bedrock-mantle. Sibling of -sol; same "
+        "Responses API path and inference contract. Probed live 2026-08-28 "
+        "(HTTP 200). NOTE: the first call to luna/terra took over 60s and timed "
+        "out before succeeding on a longer deadline — treat a slow first "
+        "response as a cold start, not a fault. Relative COST vs sol is NOT "
+        "established: the pricing is not exposed on the model API, so it will "
+        "only become visible once these are used and the per-model CUR "
+        "breakdown picks them up.",
+    ),
+    CatalogEntry(
+        public_id="gpt-5.6-terra",
+        upstream_id="openai.gpt-5.6-terra",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock_mantle",
+        base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+        inference=InferenceDefaults(
+            thinking="always_on",
+            allow_temperature=False,
+            default_profile="balanced",
+            profiles={
+                "fast": Profile(effort="low", max_tokens=4096),
+                "balanced": Profile(effort="medium", max_tokens=16000),
+                "deep": Profile(effort="high", max_tokens=32000),
+            },
+        ),
+        notes="OpenAI GPT-5.6-terra via bedrock-mantle. Sibling of -sol; same "
+        "Responses API path and inference contract. Probed live 2026-08-28 "
+        "(HTTP 200), same cold-start behaviour as luna. Relative cost vs sol "
+        "not established — see the luna note.",
     ),
     # ---- Direct OpenAI-compatible providers (openai_compat backend) --------
     # Template, disabled: enable + set the api_key_env var to route real GPT

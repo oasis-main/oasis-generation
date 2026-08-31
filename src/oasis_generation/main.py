@@ -114,6 +114,19 @@ async def _proxy_openai_compatible(
     relay the response (streaming or not). Shared by the runner and
     openai_compat backends — they differ only in base_url + auth header."""
     body = {**body, "model": entry.upstream_id}
+
+    # OpenAI's GPT-5 generation rejects `max_tokens` outright — "Unsupported
+    # parameter: 'max_tokens' is not supported with this model. Use
+    # 'max_completion_tokens' instead" (HTTP 400, observed live 2026-08-28).
+    # openclaw sends the older field, so translate it here rather than asking
+    # every caller to know which upstream wants which spelling.
+    #
+    # Scoped to api.openai.com on purpose: Google's OpenAI-compatible endpoint
+    # still accepts `max_tokens`, and renaming it there would break Gemini to
+    # fix OpenAI. Both were verified against this exact code path.
+    if "api.openai.com" in base_url and "max_tokens" in body:
+        body["max_completion_tokens"] = body.pop("max_tokens")
+
     url = f"{base_url.rstrip('/')}/chat/completions"
     client = httpx.AsyncClient(timeout=settings.upstream_timeout_s)
 

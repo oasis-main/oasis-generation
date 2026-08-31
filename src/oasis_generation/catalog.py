@@ -283,6 +283,77 @@ CATALOG: list[CatalogEntry] = [
     #                      was skipped for a data-retention refusal).
     #   xai.grok-4.6   -> 404 on Converse; the inference profile is listed as
     #                      ACTIVE but the model path is not enabled here.
+    # ---- Direct providers, moved off the bots (ADM-053, 2026-08-28) --------
+    # These models used to run from per-bot API keys, which meant the calls
+    # bypassed this gateway entirely: no ledger row, no rate card, and three
+    # provider keys sitting in every bot container — contradicting the stated
+    # design that provider keys live only here. The keys now live on the
+    # gateway and the bots hold none.
+    #
+    # NOT included, and deliberately so — both were probed live 2026-08-28:
+    #   gpt-5.5-pro            404 "This is not a chat model and thus not
+    #                          supported in the v1/chat/completions endpoint" —
+    #                          it needs the Responses API, which this backend
+    #                          does not speak.
+    #   gemini-3.1-pro-preview 429 quota exceeded on the account key. Adding it
+    #                          would ship a menu entry that fails on use.
+    # Both are a real, if small, capability loss versus the direct providers.
+    CatalogEntry(
+        public_id="gpt-5.4-mini",
+        upstream_id="gpt-5.4-mini",
+        tier="frontier",
+        enabled=True,
+        backend="openai_compat",
+        base_url="https://api.openai.com/v1",
+        api_key_env="OPENAI_API_KEY",
+        notes="Direct OpenAI GPT-5.4-mini through the gateway. Probed live "
+        "2026-08-28 (HTTP 200).",
+    ),
+    CatalogEntry(
+        public_id="gpt-5.5",
+        upstream_id="gpt-5.5",
+        tier="frontier",
+        enabled=True,
+        backend="openai_compat",
+        base_url="https://api.openai.com/v1",
+        api_key_env="OPENAI_API_KEY",
+        notes="Direct OpenAI GPT-5.5 through the gateway. Probed live "
+        "2026-08-28 (HTTP 200).",
+    ),
+    CatalogEntry(
+        public_id="gemini-3.6-flash",
+        upstream_id="gemini-3.6-flash",
+        tier="frontier",
+        enabled=True,
+        backend="openai_compat",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        api_key_env="GEMINI_API_KEY",
+        notes="Google Gemini 3.6 Flash via its OpenAI-compatible endpoint. "
+        "Probed live 2026-08-28 (HTTP 200).",
+    ),
+    # The two Claude models the bots reached through the ANTHROPIC key are
+    # served here from Bedrock instead — same models, one billing relationship,
+    # and they land in the same CUR the digest already breaks down by model.
+    CatalogEntry(
+        public_id="claude-sonnet-4-6",
+        upstream_id="us.anthropic.claude-sonnet-4-6",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Sonnet 4.6 via Bedrock, replacing the direct "
+        "Anthropic path (ADM-053).",
+    ),
+    CatalogEntry(
+        public_id="claude-opus-4-7",
+        upstream_id="us.anthropic.claude-opus-4-7",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("xhigh"),
+        notes="Anthropic Claude Opus 4.7 via Bedrock, replacing the direct "
+        "Anthropic path (ADM-053).",
+    ),
     CatalogEntry(
         public_id="claude-haiku-4-5",
         upstream_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -448,7 +519,7 @@ CATALOG: list[CatalogEntry] = [
         public_id="gemini-3.1-flash-lite",
         upstream_id="gemini-3.1-flash-lite",
         tier="google",
-        enabled=False,
+        enabled=True,
         backend="openai_compat",
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         api_key_env="GEMINI_API_KEY",

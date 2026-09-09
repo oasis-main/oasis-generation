@@ -283,54 +283,35 @@ CATALOG: list[CatalogEntry] = [
     #                      was skipped for a data-retention refusal).
     #   xai.grok-4.6   -> 404 on Converse; the inference profile is listed as
     #                      ACTIVE but the model path is not enabled here.
-    # ---- Direct providers, moved off the bots (ADM-053, 2026-08-28) --------
-    # These models used to run from per-bot API keys, which meant the calls
-    # bypassed this gateway entirely: no ledger row, no rate card, and three
-    # provider keys sitting in every bot container — contradicting the stated
-    # design that provider keys live only here. The keys now live on the
-    # gateway and the bots hold none.
+    # ---- Direct-provider proxying: RETIRED (ADM-055, 2026-09-09) -----------
+    # ADM-053 moved the per-bot OpenAI/Google/Anthropic keys onto this gateway.
+    # ADM-055 removes the proxying altogether. The catalog now serves models
+    # from exactly two places: Amazon Bedrock, and models we host ourselves.
     #
-    # NOT included, and deliberately so — both were probed live 2026-08-28:
-    #   gpt-5.5-pro            404 "This is not a chat model and thus not
-    #                          supported in the v1/chat/completions endpoint" —
-    #                          it needs the Responses API, which this backend
-    #                          does not speak.
-    #   gemini-3.1-pro-preview 429 quota exceeded on the account key. Adding it
-    #                          would ship a menu entry that fails on use.
-    # Both are a real, if small, capability loss versus the direct providers.
-    CatalogEntry(
-        public_id="gpt-5.4-mini",
-        upstream_id="gpt-5.4-mini",
-        tier="frontier",
-        enabled=True,
-        backend="openai_compat",
-        base_url="https://api.openai.com/v1",
-        api_key_env="OPENAI_API_KEY",
-        notes="Direct OpenAI GPT-5.4-mini through the gateway. Probed live "
-        "2026-08-28 (HTTP 200).",
-    ),
-    CatalogEntry(
-        public_id="gpt-5.5",
-        upstream_id="gpt-5.5",
-        tier="frontier",
-        enabled=True,
-        backend="openai_compat",
-        base_url="https://api.openai.com/v1",
-        api_key_env="OPENAI_API_KEY",
-        notes="Direct OpenAI GPT-5.5 through the gateway. Probed live "
-        "2026-08-28 (HTTP 200).",
-    ),
-    CatalogEntry(
-        public_id="gemini-3.6-flash",
-        upstream_id="gemini-3.6-flash",
-        tier="frontier",
-        enabled=True,
-        backend="openai_compat",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        api_key_env="GEMINI_API_KEY",
-        notes="Google Gemini 3.6 Flash via its OpenAI-compatible endpoint. "
-        "Probed live 2026-08-28 (HTTP 200).",
-    ),
+    # WHY. The ADM-054 data-retention audit (2026-09-09) established what each
+    # path actually promises:
+    #   Bedrock  - AWS does not train on our content and does not share it with
+    #              the model providers; the Model Deployment Account gives the
+    #              providers no path to our prompts. Default is zero retention
+    #              and zero operator access.
+    #   OpenAI   - no training on API data by default, 30-day abuse retention.
+    #   Google   - the key in use was on the UNPAID tier, where Google uses the
+    #              content to develop its products and human reviewers may read
+    #              it. Proven behaviourally: 9 of 24 rapid calls succeeded and
+    #              14 were rejected naming free-tier quota metrics.
+    #
+    # Two providers with three different retention stories is not a posture we
+    # can describe to a customer in one sentence. Bedrock already serves the
+    # same Claude and GPT-5.6 families, so the proxy path bought variety at the
+    # cost of a coherent privacy claim. Removed rather than re-papered.
+    #
+    # Capability actually lost: gemini-3.6-flash and gemini-3.1-flash-lite (no
+    # Bedrock equivalent for the 1M-token Gemini context). gpt-5.4-mini and
+    # gpt-5.5 are covered by gpt-5.6-luna/terra/sol on bedrock_mantle.
+    #
+    # NOTE this does NOT touch tools.media.video, which reaches Google from the
+    # bot side (models.providers.google), not through this catalog. Nimbus and
+    # Hello World still hold GEMINI_API_KEY for that one capability.
     # The two Claude models the bots reached through the ANTHROPIC key are
     # served here from Bedrock instead — same models, one billing relationship,
     # and they land in the same CUR the digest already breaks down by model.
@@ -515,18 +496,6 @@ CATALOG: list[CatalogEntry] = [
     # Google resolves through its OpenAI-compatibility surface, so the existing
     # openai_compat path handles it unmodified (same {base_url}/chat/completions +
     # bearer shape). Verify the endpoint against current Google docs before enabling.
-    CatalogEntry(
-        public_id="gemini-3.1-flash-lite",
-        upstream_id="gemini-3.1-flash-lite",
-        tier="google",
-        enabled=True,
-        backend="openai_compat",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        api_key_env="GEMINI_API_KEY",
-        notes="Direct Google Gemini via its OpenAI-compatible endpoint. Staged disabled for "
-        "the key-consolidation move; enable + set GEMINI_API_KEY on the gateway. Cheap/fast "
-        "tier — also the natural exec-autoReview reviewer model once bots route through here.",
-    ),
     # Anthropic: deliberately NOT added as an openai_compat entry. Its native API
     # is the Messages API, not OpenAI chat-completions, so this backend's
     # {base_url}/chat/completions + Bearer shape does not apply as-is. Claude is

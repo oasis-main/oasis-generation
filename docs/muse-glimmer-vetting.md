@@ -24,7 +24,7 @@ including a ~1.8B vision encoder). No 31B repository exists under
 | Remote-code hooks | None. No `auto_map`, `trust_remote_code`, or `custom_pipelines` in `config.json`, `tokenizer_config.json`, `processor_config.json`, or `generation_config.json`. |
 | Hugging Face security scanner | `scansDone: true`, `filesWithIssues: []` on the main repo, the drafter repo, and the official GGUF repo. |
 | Chat template (`chat_template.jinja`, 9,992 bytes) | No URLs, no encoded blobs, no hidden instructions. Only a default system line ("You are a helpful AI assistant.") and a tool-calling format. |
-| Revision pin | Record `a4e59da52a7b` in the archive manifest. The transfer script writes the resolved revision and per-file sha256 into `MANIFEST-*.json`. |
+| Revision pin | The box already holds revision `97c77dff50b2` (archived 2026-08-11, 13 files, 59,581,826,391 bytes). The vetted head `a4e59da52a7b` differs in ONE file only: `chat_template.jinja` (7,167 -> 9,992 bytes, commit "Fixing duplicate reasoning effort - formatting"). Both weight shards and the other 10 files are byte-identical by LFS sha256, so the archive was not re-copied. Both template versions were scanned: no URLs, encoded blobs, or injected instructions. Fetch the newer template from the head revision before any serving use. |
 
 ## 2. Behavioral red-team — NOT RUN (deferred, not skipped)
 

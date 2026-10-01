@@ -400,3 +400,60 @@ def test_malformed_or_missing_images_dropped():
     assert bedrock._image_block("data:image/png;base64,!!!!") is None
     assert bedrock._image_block("not a data uri") is None
     assert bedrock._image_block(None) is None
+
+
+# ---- Prompt caching (2026-10-01) -------------------------------------------
+
+def _cache_body():
+    return {
+        "messages": [
+            {"role": "system", "content": "You are a bot."},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}],
+    }
+
+
+def test_cache_points_tools_system_and_last_user_turn():
+    kw = bedrock.openai_to_converse(_cache_body(), prompt_cache=True)
+    assert kw["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default"}}
+    assert kw["system"][-1] == {"cachePoint": {"type": "default"}}
+    assert kw["messages"][-1]["content"][-1] == {"cachePoint": {"type": "default"}}
+    # Only the final turn carries the rolling point: three points in total.
+    flat = json.dumps(kw)
+    assert flat.count("cachePoint") == 3
+
+
+def test_no_cache_points_by_default():
+    assert "cachePoint" not in json.dumps(bedrock.openai_to_converse(_cache_body()))
+
+
+def test_no_message_cache_point_after_assistant_prefill():
+    body = _cache_body()
+    body["messages"].append({"role": "assistant", "content": "prefill"})
+    kw = bedrock.openai_to_converse(body, prompt_cache=True)
+    assert "cachePoint" not in json.dumps(kw["messages"])
+
+
+def test_cache_point_follows_a_tool_result_turn():
+    body = _cache_body()
+    body["messages"][-1] = {
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
+    }
+    body["messages"].append({"role": "tool", "tool_call_id": "c1", "content": "result"})
+    kw = bedrock.openai_to_converse(body, prompt_cache=True)
+    last = kw["messages"][-1]["content"]
+    assert "toolResult" in last[0] and last[-1] == {"cachePoint": {"type": "default"}}
+
+
+def test_supports_prompt_cache_claude_only(monkeypatch):
+    monkeypatch.delenv("OASIS_GENERATION_PROMPT_CACHE", raising=False)
+    assert bedrock.supports_prompt_cache("us.anthropic.claude-sonnet-5")
+    for other in ("us.amazon.nova-micro-v1:0", "us.openai.gpt-6-astra", "zai.glm-5",
+                  "us.meta.llama3-3-70b-instruct-v1:0"):
+        assert not bedrock.supports_prompt_cache(other)
+    monkeypatch.setenv("OASIS_GENERATION_PROMPT_CACHE", "0")
+    assert not bedrock.supports_prompt_cache("us.anthropic.claude-sonnet-5")

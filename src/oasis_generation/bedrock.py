@@ -18,6 +18,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -296,7 +297,47 @@ def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
     return "user", _content_to_converse_blocks(msg.get("content"))
 
 
-def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) -> dict[str, Any]:
+# Prompt caching (2026-10-01). Converse caches ONLY up to an explicit
+# `cachePoint` block, and an OpenAI chat body carries no such marker, so before
+# this the gateway sent every fleet turn uncached: September dev Bedrock was
+# ~$1,001 of input against $0.02 of cache reads (Yes Man's Cost Explorer pull).
+# Claude on Bedrock allows up to 4 cache points; the gateway places 3, matching
+# Anthropic's prefix order tools -> system -> messages:
+#   1. end of the tool list    (stable for a bot's whole life)
+#   2. end of the system prompt (stable per session; the entrypoint sorts paths
+#      so the bytes do not move)
+#   3. end of the final user turn — the rolling point. The next agent-loop turn
+#      re-sends this exact prefix plus a few new blocks, and Anthropic's 20-block
+#      lookback finds the previous point, so each turn reads the history as a
+#      cache hit and writes only the new tail.
+# A prefix shorter than the model minimum is simply not cached (no error).
+# Non-Anthropic Bedrock models (Nova, Llama, GLM, GPT) reject or ignore the
+# block, so they never get one. OASIS_GENERATION_PROMPT_CACHE=0 turns it off.
+_CACHE_POINT = {"cachePoint": {"type": "default"}}
+
+
+def supports_prompt_cache(model_id: str) -> bool:
+    if os.environ.get("OASIS_GENERATION_PROMPT_CACHE", "1") == "0":
+        return False
+    return "anthropic.claude" in (model_id or "")
+
+
+def _add_cache_points(kwargs: dict[str, Any]) -> None:
+    tools = (kwargs.get("toolConfig") or {}).get("tools")
+    if tools:
+        tools.append(dict(_CACHE_POINT))
+    if kwargs.get("system"):
+        kwargs["system"].append(dict(_CACHE_POINT))
+    messages = kwargs.get("messages") or []
+    # Only after a user turn: a trailing assistant turn is a prefill, and a
+    # cache point there would cache a prefix the next call never repeats.
+    if messages and messages[-1]["role"] == "user" and messages[-1]["content"]:
+        messages[-1]["content"].append(dict(_CACHE_POINT))
+
+
+def openai_to_converse(
+    body: dict, defaults: "InferenceDefaults | None" = None, prompt_cache: bool = False,
+) -> dict[str, Any]:
     """Build converse()/converse_stream() kwargs (minus modelId) from an OpenAI
     chat-completions body, applying the model's inference policy (`defaults`).
 
@@ -353,6 +394,8 @@ def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) 
         amrf["output_config"] = {"effort": effort}
     if amrf:
         kwargs["additionalModelRequestFields"] = amrf
+    if prompt_cache:
+        _add_cache_points(kwargs)
     return kwargs
 
 
@@ -432,7 +475,7 @@ async def complete(
     defaults: "InferenceDefaults | None" = None,
 ) -> dict:
     """Non-streaming completion. boto3 is sync, so run it off the event loop."""
-    kwargs = openai_to_converse(body, defaults)
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id))
     try:
         resp = await asyncio.to_thread(_client(region).converse, modelId=model_id, **kwargs)
     except Exception:
@@ -460,7 +503,7 @@ async def stream(
     worker thread and hand chunks to the async generator via a queue so the
     FastAPI event loop is never blocked.
     """
-    kwargs = openai_to_converse(body, defaults)
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id))
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))

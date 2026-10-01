@@ -404,36 +404,88 @@ def test_malformed_or_missing_images_dropped():
 
 # ---- Prompt caching (2026-10-01) -------------------------------------------
 
-def _cache_body():
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _fresh_prefix_memory():
+    bedrock._prefix_seen.clear()
+    yield
+    bedrock._prefix_seen.clear()
+
+
+CP = {"cachePoint": {"type": "default"}}
+
+
+def _cache_body(system="You are a bot.", last="second"):
     return {
         "messages": [
-            {"role": "system", "content": "You are a bot."},
+            {"role": "system", "content": system},
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "ok"},
-            {"role": "user", "content": "second"},
+            {"role": "user", "content": last},
         ],
         "tools": [{"type": "function", "function": {"name": "t", "parameters": {"type": "object"}}}],
     }
 
 
-def test_cache_points_tools_system_and_last_user_turn():
-    kw = bedrock.openai_to_converse(_cache_body(), prompt_cache=True)
-    assert kw["toolConfig"]["tools"][-1] == {"cachePoint": {"type": "default"}}
-    assert kw["system"][-1] == {"cachePoint": {"type": "default"}}
-    assert kw["messages"][-1]["content"][-1] == {"cachePoint": {"type": "default"}}
-    # Only the final turn carries the rolling point: three points in total.
-    flat = json.dumps(kw)
-    assert flat.count("cachePoint") == 3
+def _conv(body, **kw):
+    return bedrock.openai_to_converse(body, prompt_cache=True, cache_key="m", **kw)
 
 
-def test_no_cache_points_by_default():
+def test_first_sighting_places_no_cache_points():
+    assert "cachePoint" not in json.dumps(_conv(_cache_body()))
+
+
+def test_recurring_prefix_gets_tools_system_and_rolling_points():
+    _conv(_cache_body())
+    kw = _conv(_cache_body(last="third"))
+    assert kw["toolConfig"]["tools"][-1] == CP
+    assert kw["system"][-1] == CP
+    assert kw["messages"][-1]["content"][-1] == CP
+    assert json.dumps(kw).count("cachePoint") == 3
+
+
+def test_changing_system_prompt_never_caches_system_or_history():
+    # The reviewer-judge shape: a per-call nonce inside the system prompt.
+    _conv(_cache_body(system="nonce 1"))
+    kw = _conv(_cache_body(system="nonce 2"))
+    assert kw["toolConfig"]["tools"][-1] == CP          # tools still recur
+    assert "cachePoint" not in json.dumps(kw["system"])
+    assert "cachePoint" not in json.dumps(kw["messages"])
+
+
+def test_one_shot_call_gets_no_rolling_point():
+    body = {"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "q1"}]}
+    _conv(body)
+    kw = _conv({"messages": [{"role": "system", "content": "S"}, {"role": "user", "content": "q2"}]})
+    assert kw["system"][-1] == CP
+    assert "cachePoint" not in json.dumps(kw["messages"])
+
+
+def test_prefix_memory_expires_after_ttl():
+    kw = bedrock.openai_to_converse(_cache_body(), prompt_cache=True, cache_key="m")
+    bedrock._prefix_seen.update({k: v - 301 for k, v in bedrock._prefix_seen.items()})
+    kw = _conv(_cache_body())
+    assert "cachePoint" not in json.dumps(kw)
+
+
+def test_prefix_memory_is_per_model():
+    _conv(_cache_body())
+    kw = bedrock.openai_to_converse(_cache_body(), prompt_cache=True, cache_key="other")
+    assert "cachePoint" not in json.dumps(kw)
+
+
+def test_no_cache_points_when_disabled():
+    bedrock.openai_to_converse(_cache_body())
     assert "cachePoint" not in json.dumps(bedrock.openai_to_converse(_cache_body()))
 
 
 def test_no_message_cache_point_after_assistant_prefill():
     body = _cache_body()
     body["messages"].append({"role": "assistant", "content": "prefill"})
-    kw = bedrock.openai_to_converse(body, prompt_cache=True)
+    _conv(body)
+    kw = _conv(body)
     assert "cachePoint" not in json.dumps(kw["messages"])
 
 
@@ -444,9 +496,10 @@ def test_cache_point_follows_a_tool_result_turn():
         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "t", "arguments": "{}"}}],
     }
     body["messages"].append({"role": "tool", "tool_call_id": "c1", "content": "result"})
-    kw = bedrock.openai_to_converse(body, prompt_cache=True)
+    _conv(body)
+    kw = _conv(body)
     last = kw["messages"][-1]["content"]
-    assert "toolResult" in last[0] and last[-1] == {"cachePoint": {"type": "default"}}
+    assert "toolResult" in last[0] and last[-1] == CP
 
 
 def test_supports_prompt_cache_claude_only(monkeypatch):

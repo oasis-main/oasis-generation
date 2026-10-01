@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -313,7 +314,26 @@ def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
 # A prefix shorter than the model minimum is simply not cached (no error).
 # Non-Anthropic Bedrock models (Nova, Llama, GLM, GPT) reject or ignore the
 # block, so they never get one. OASIS_GENERATION_PROMPT_CACHE=0 turns it off.
+#
+# CACHE ONLY WHAT RECURS (same day, after the first deploy). A cache write
+# costs 1.25x input and pays off only if the same prefix is READ within the
+# ~5-minute TTL. Unconditional points made one-shot traffic dearer: the
+# oasis-reviewer judge puts a per-call random nonce in its SYSTEM prompt, so
+# every judge call wrote ~13k tokens at 1.25x and none were ever read. So:
+#   - tools / system points go on only when the same (model, prefix) hash was
+#     seen within the TTL — a never-repeating prefix stays at 1x;
+#   - the rolling message point goes on only for a continuing conversation
+#     (an assistant turn exists) whose system prefix recurred, because history
+#     after a changing system prompt can never be read back either.
+# In-process memory of hashes only (no prompt text); a restart just costs one
+# uncached call per prefix.
 _CACHE_POINT = {"cachePoint": {"type": "default"}}
+_CACHE_TTL_S = 300.0
+_PREFIX_SEEN_MAX = 4096
+_prefix_seen: dict[str, float] = {}
+# A child of uvicorn's INFO-level logger: the app sets no logging config, so a
+# plain module logger's INFO lines would be dropped.
+_cache_log = logging.getLogger("uvicorn.error.prompt_cache")
 
 
 def supports_prompt_cache(model_id: str) -> bool:
@@ -322,21 +342,49 @@ def supports_prompt_cache(model_id: str) -> bool:
     return "anthropic.claude" in (model_id or "")
 
 
-def _add_cache_points(kwargs: dict[str, Any]) -> None:
-    tools = (kwargs.get("toolConfig") or {}).get("tools")
-    if tools:
-        tools.append(dict(_CACHE_POINT))
-    if kwargs.get("system"):
-        kwargs["system"].append(dict(_CACHE_POINT))
+def _recurred(key: str, now: float) -> bool:
+    """True if `key` was seen within the cache TTL; records this sighting."""
+    last = _prefix_seen.get(key)
+    _prefix_seen[key] = now
+    if len(_prefix_seen) > _PREFIX_SEEN_MAX:
+        for old in sorted(_prefix_seen, key=_prefix_seen.get)[: _PREFIX_SEEN_MAX // 4]:
+            del _prefix_seen[old]
+    return last is not None and now - last <= _CACHE_TTL_S
+
+
+def _digest(*parts: Any) -> str:
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _add_cache_points(kwargs: dict[str, Any], cache_key: str, now: float | None = None) -> dict:
+    now = time.monotonic() if now is None else now
+    tools = (kwargs.get("toolConfig") or {}).get("tools") or []
+    system = kwargs.get("system") or []
     messages = kwargs.get("messages") or []
-    # Only after a user turn: a trailing assistant turn is a prefill, and a
-    # cache point there would cache a prefix the next call never repeats.
-    if messages and messages[-1]["role"] == "user" and messages[-1]["content"]:
+    tools_h = _digest(cache_key, tools)
+    system_h = _digest(cache_key, tools, system)
+    placed = []
+    if tools and _recurred("t:" + tools_h, now):
+        tools.append(dict(_CACHE_POINT))
+        placed.append("tools")
+    system_recurred = bool(system) and _recurred("s:" + system_h, now)
+    if system_recurred:
+        system.append(dict(_CACHE_POINT))
+        placed.append("system")
+    # Rolling point: only after a user turn (a trailing assistant turn is a
+    # prefill) in a conversation that already has an assistant turn.
+    continuing = any(m["role"] == "assistant" for m in messages[:-1])
+    if (system_recurred and continuing and messages
+            and messages[-1]["role"] == "user" and messages[-1]["content"]):
         messages[-1]["content"].append(dict(_CACHE_POINT))
+        placed.append("messages")
+    return {"tools": tools_h if tools else "-", "system": system_h if system else "-",
+            "n_messages": len(messages), "placed": placed}
 
 
 def openai_to_converse(
     body: dict, defaults: "InferenceDefaults | None" = None, prompt_cache: bool = False,
+    cache_key: str = "",
 ) -> dict[str, Any]:
     """Build converse()/converse_stream() kwargs (minus modelId) from an OpenAI
     chat-completions body, applying the model's inference policy (`defaults`).
@@ -395,7 +443,12 @@ def openai_to_converse(
     if amrf:
         kwargs["additionalModelRequestFields"] = amrf
     if prompt_cache:
-        _add_cache_points(kwargs)
+        info = _add_cache_points(kwargs, cache_key)
+        # Hashes only, never prompt text: shows whether a client's tools/system
+        # prefix is stable across turns, which decides whether caching can pay.
+        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d placed=%s",
+                    cache_key, info["tools"], info["system"], info["n_messages"],
+                    ",".join(info["placed"]) or "none")
     return kwargs
 
 
@@ -475,7 +528,7 @@ async def complete(
     defaults: "InferenceDefaults | None" = None,
 ) -> dict:
     """Non-streaming completion. boto3 is sync, so run it off the event loop."""
-    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id))
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id), cache_key=model_id)
     try:
         resp = await asyncio.to_thread(_client(region).converse, modelId=model_id, **kwargs)
     except Exception:
@@ -503,7 +556,7 @@ async def stream(
     worker thread and hand chunks to the async generator via a queue so the
     FastAPI event loop is never blocked.
     """
-    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id))
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id), cache_key=model_id)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))

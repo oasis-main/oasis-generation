@@ -410,8 +410,10 @@ import pytest
 @pytest.fixture(autouse=True)
 def _fresh_prefix_memory():
     bedrock._prefix_seen.clear()
+    bedrock._history_seen.clear()
     yield
     bedrock._prefix_seen.clear()
+    bedrock._history_seen.clear()
 
 
 CP = {"cachePoint": {"type": "default"}}
@@ -443,7 +445,9 @@ def test_recurring_prefix_gets_tools_system_and_rolling_points():
     assert kw["toolConfig"]["tools"][-1] == CP
     assert kw["system"][-1] == CP
     assert kw["messages"][-1]["content"][-1] == CP
-    assert json.dumps(kw).count("cachePoint") == 3
+    # 4th point: end of the user turn before the latest assistant turn
+    assert kw["messages"][0]["content"][-1] == CP
+    assert json.dumps(kw).count("cachePoint") == 4
 
 
 def test_changing_system_prompt_never_caches_system_or_history():
@@ -510,3 +514,24 @@ def test_supports_prompt_cache_claude_only(monkeypatch):
         assert not bedrock.supports_prompt_cache(other)
     monkeypatch.setenv("OASIS_GENERATION_PROMPT_CACHE", "0")
     assert not bedrock.supports_prompt_cache("us.anthropic.claude-sonnet-5")
+
+
+def test_history_diagnostic_detects_rewritten_turns():
+    body = _cache_body()
+    _conv(body)
+    grown = _cache_body()
+    grown["messages"] += [{"role": "assistant", "content": "ok2"}, {"role": "user", "content": "third"}]
+    kw_info = bedrock._add_cache_points(bedrock.openai_to_converse(grown), "m")
+    assert kw_info["history"] == "yes"
+    rewritten = _cache_body()
+    rewritten["messages"][1]["content"] = "first (pruned)"
+    rewritten["messages"] += [{"role": "assistant", "content": "ok2"}, {"role": "user", "content": "x"}]
+    assert bedrock._add_cache_points(bedrock.openai_to_converse(rewritten), "m")["history"] == "no"
+
+
+def test_never_more_than_four_cache_points():
+    body = _cache_body()
+    for i in range(6):
+        body["messages"] += [{"role": "assistant", "content": f"a{i}"}, {"role": "user", "content": f"u{i}"}]
+    _conv(body)
+    assert json.dumps(_conv(body)).count("cachePoint") == 4

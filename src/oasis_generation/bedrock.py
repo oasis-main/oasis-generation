@@ -331,6 +331,7 @@ _CACHE_POINT = {"cachePoint": {"type": "default"}}
 _CACHE_TTL_S = 300.0
 _PREFIX_SEEN_MAX = 4096
 _prefix_seen: dict[str, float] = {}
+_history_seen: dict[str, tuple[int, str]] = {}
 # A child of uvicorn's INFO-level logger: the app sets no logging config, so a
 # plain module logger's INFO lines would be dropped.
 _cache_log = logging.getLogger("uvicorn.error.prompt_cache")
@@ -371,15 +372,36 @@ def _add_cache_points(kwargs: dict[str, Any], cache_key: str, now: float | None 
     if system_recurred:
         system.append(dict(_CACHE_POINT))
         placed.append("system")
+    # Diagnostic: is the history up to the previous call (same system prefix)
+    # byte-identical? "no" means the client rewrote earlier turns (pruning,
+    # compaction), which no cache point can survive. Hashes only.
+    history = "-"
+    if system:
+        prev = _history_seen.get(system_h)
+        if prev and len(messages) >= prev[0]:
+            history = "yes" if _digest(messages[: prev[0]]) == prev[1] else "no"
+        _history_seen[system_h] = (len(messages), _digest(messages))
+        if len(_history_seen) > _PREFIX_SEEN_MAX:
+            for old in list(_history_seen)[: _PREFIX_SEEN_MAX // 4]:
+                del _history_seen[old]
     # Rolling point: only after a user turn (a trailing assistant turn is a
     # prefill) in a conversation that already has an assistant turn.
     continuing = any(m["role"] == "assistant" for m in messages[:-1])
     if (system_recurred and continuing and messages
             and messages[-1]["role"] == "user" and messages[-1]["content"]):
+        # 4th point (Claude's maximum): the end of the user turn before the
+        # latest assistant turn — exactly where the PREVIOUS call put its
+        # rolling point. Anthropic only looks back 20 blocks from a cache
+        # point, and one assistant turn with many parallel tool calls adds
+        # more than that, so without this the previous cache entry is missed.
+        last_asst = max(i for i, m in enumerate(messages[:-1]) if m["role"] == "assistant")
+        if last_asst > 0 and messages[last_asst - 1]["role"] == "user":
+            messages[last_asst - 1]["content"].append(dict(_CACHE_POINT))
+            placed.append("previous")
         messages[-1]["content"].append(dict(_CACHE_POINT))
         placed.append("messages")
     return {"tools": tools_h if tools else "-", "system": system_h if system else "-",
-            "n_messages": len(messages), "placed": placed}
+            "n_messages": len(messages), "placed": placed, "history": history}
 
 
 def openai_to_converse(
@@ -446,9 +468,9 @@ def openai_to_converse(
         info = _add_cache_points(kwargs, cache_key)
         # Hashes only, never prompt text: shows whether a client's tools/system
         # prefix is stable across turns, which decides whether caching can pay.
-        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d placed=%s",
+        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d history=%s placed=%s",
                     cache_key, info["tools"], info["system"], info["n_messages"],
-                    ",".join(info["placed"]) or "none")
+                    info["history"], ",".join(info["placed"]) or "none")
     return kwargs
 
 

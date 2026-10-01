@@ -62,3 +62,13 @@ variable "extra_tags" {
   type    = list(string)
   default = []
 }
+
+variable "lease_until" {
+  type        = string
+  default     = ""
+  description = "Unix seconds after which the infra-reaper (ADM-057) powers this instance off. Empty = the reaper's 3h grace from the last state change applies. Example: tostring(time_static.session.unix + 4 * 3600)."
+  validation {
+    condition     = var.lease_until == "" || can(regex("^[0-9]{10}$", var.lease_until))
+    error_message = "lease_until must be empty or 10-digit unix seconds."
+  }
+}

@@ -331,7 +331,7 @@ _CACHE_POINT = {"cachePoint": {"type": "default"}}
 _CACHE_TTL_S = 300.0
 _PREFIX_SEEN_MAX = 4096
 _prefix_seen: dict[str, float] = {}
-_history_seen: dict[str, tuple[int, str]] = {}
+_history_seen: dict[str, list] = {}
 # A child of uvicorn's INFO-level logger: the app sets no logging config, so a
 # plain module logger's INFO lines would be dropped.
 _cache_log = logging.getLogger("uvicorn.error.prompt_cache")
@@ -374,13 +374,18 @@ def _add_cache_points(kwargs: dict[str, Any], cache_key: str, now: float | None 
         placed.append("system")
     # Diagnostic: is the history up to the previous call (same system prefix)
     # byte-identical? "no" means the client rewrote earlier turns (pruning,
-    # compaction), which no cache point can survive. Hashes only.
-    history = "-"
+    # compaction), which no cache point can survive. On "no", `diverge` names
+    # the first differing message and block — its index, the message's role,
+    # the block's kind (text/toolUse/toolResult/image/...) and its old and new
+    # sizes — so the rewrite can be traced to the client feature doing it.
+    # Hashes and sizes only; no prompt text is kept or logged.
+    history, diverge = "-", ""
     if system:
+        profile = _history_profile(messages)
         prev = _history_seen.get(system_h)
-        if prev and len(messages) >= prev[0]:
-            history = "yes" if _digest(messages[: prev[0]]) == prev[1] else "no"
-        _history_seen[system_h] = (len(messages), _digest(messages))
+        if prev:
+            history, diverge = _compare_history(prev, profile)
+        _history_seen[system_h] = profile
         if len(_history_seen) > _PREFIX_SEEN_MAX:
             for old in list(_history_seen)[: _PREFIX_SEEN_MAX // 4]:
                 del _history_seen[old]
@@ -401,7 +406,39 @@ def _add_cache_points(kwargs: dict[str, Any], cache_key: str, now: float | None 
         messages[-1]["content"].append(dict(_CACHE_POINT))
         placed.append("messages")
     return {"tools": tools_h if tools else "-", "system": system_h if system else "-",
-            "n_messages": len(messages), "placed": placed, "history": history}
+            "n_messages": len(messages), "placed": placed, "history": history,
+            "diverge": diverge}
+
+
+def _history_profile(messages: list[dict]) -> list[tuple[str, str, list[tuple[str, str, int]]]]:
+    """Per message: (role, digest, [(block kind, block digest, block JSON size)])."""
+    out = []
+    for m in messages:
+        blocks = []
+        for b in m.get("content") or []:
+            kind = next(iter(b), "?") if isinstance(b, dict) else type(b).__name__
+            blocks.append((kind, _digest(b), len(json.dumps(b, default=str))))
+        out.append((m.get("role", "?"), _digest(m), blocks))
+    return out
+
+
+def _compare_history(prev: list, cur: list) -> tuple[str, str]:
+    """('yes'|'no'|'-', detail) for the previous call's messages vs this call's."""
+    if len(cur) < len(prev):
+        return "no", f"shorter {len(prev)}->{len(cur)}"
+    for i, (p, c) in enumerate(zip(prev, cur)):
+        if p[1] == c[1]:
+            continue
+        role, pb, cb = c[0], p[2], c[2]
+        for j in range(max(len(pb), len(cb))):
+            if j >= len(pb) or j >= len(cb) or pb[j][1] != cb[j][1]:
+                kind = (cb[j] if j < len(cb) else pb[j])[0]
+                old = pb[j][2] if j < len(pb) else 0
+                new = cb[j][2] if j < len(cb) else 0
+                return "no", (f"msg{i}/{len(prev)} role={role} block{j}/{len(cb)} "
+                              f"kind={kind} size={old}->{new}")
+        return "no", f"msg{i}/{len(prev)} role={role} (role or block count changed)"
+    return "yes", ""
 
 
 def openai_to_converse(
@@ -468,9 +505,10 @@ def openai_to_converse(
         info = _add_cache_points(kwargs, cache_key)
         # Hashes only, never prompt text: shows whether a client's tools/system
         # prefix is stable across turns, which decides whether caching can pay.
-        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d history=%s placed=%s",
+        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d history=%s placed=%s%s",
                     cache_key, info["tools"], info["system"], info["n_messages"],
-                    info["history"], ",".join(info["placed"]) or "none")
+                    info["history"], ",".join(info["placed"]) or "none",
+                    f" diverge={info['diverge']}" if info["diverge"] else "")
     return kwargs
 
 

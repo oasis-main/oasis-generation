@@ -535,3 +535,24 @@ def test_never_more_than_four_cache_points():
         body["messages"] += [{"role": "assistant", "content": f"a{i}"}, {"role": "user", "content": f"u{i}"}]
     _conv(body)
     assert json.dumps(_conv(body)).count("cachePoint") == 4
+
+
+def test_divergence_names_the_first_rewritten_block():
+    base = _cache_body()
+    base["messages"][1]["content"] = [{"type": "text", "text": "first"}, {"type": "text", "text": "keep"}]
+    _conv(base)
+    grown = _cache_body()
+    grown["messages"][1]["content"] = [{"type": "text", "text": "first"}, {"type": "text", "text": "kept but trimmed"}]
+    grown["messages"] += [{"role": "assistant", "content": "ok2"}, {"role": "user", "content": "third"}]
+    info = bedrock._add_cache_points(bedrock.openai_to_converse(grown), "m")
+    # The translation joins a user turn's text parts into ONE text block.
+    assert info["history"] == "no"
+    assert info["diverge"] == "msg0/3 role=user block0/1 kind=text size=21->33"
+
+
+def test_no_divergence_detail_when_history_is_stable():
+    _conv(_cache_body())
+    grown = _cache_body()
+    grown["messages"] += [{"role": "assistant", "content": "ok2"}, {"role": "user", "content": "third"}]
+    info = bedrock._add_cache_points(bedrock.openai_to_converse(grown), "m")
+    assert info["history"] == "yes" and info["diverge"] == ""

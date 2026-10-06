@@ -544,14 +544,20 @@ def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
 
 def _usage(u: dict | None) -> dict:
     u = u or {}
+    read = u.get("cacheReadInputTokens", 0) or 0
+    write = u.get("cacheWriteInputTokens", 0) or 0
+    # OpenAI convention: prompt_tokens INCLUDES cached tokens (Converse's
+    # inputTokens excludes them), with the cached share in prompt_tokens_details.
+    # openclaw reads only these two fields, so before 2026-10-03 a cached
+    # 220K-token turn looked like a 6-token prompt to the sleep-cycle
+    # context-nap, which therefore never fired (same fix as the Kaizen shim).
     return {
-        "prompt_tokens": u.get("inputTokens", 0),
+        "prompt_tokens": (u.get("inputTokens", 0) or 0) + read + write,
         "completion_tokens": u.get("outputTokens", 0),
         "total_tokens": u.get("totalTokens", 0),
-        # Passed through so callers (e.g. the sleep-cycle context-nap) can see
-        # the true prompt size including cached tokens.
-        "cache_read_input_tokens": u.get("cacheReadInputTokens", 0),
-        "cache_write_input_tokens": u.get("cacheWriteInputTokens", 0),
+        "prompt_tokens_details": {"cached_tokens": read},
+        "cache_read_input_tokens": read,
+        "cache_write_input_tokens": write,
     }
 
 

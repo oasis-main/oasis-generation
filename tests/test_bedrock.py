@@ -162,6 +162,20 @@ def test_converse_to_openai_shape():
     assert out["usage"]["completion_tokens"] == 5
 
 
+def test_usage_counts_cached_tokens_in_prompt_tokens():
+    # OpenAI convention, which openclaw reads: prompt_tokens includes the cached
+    # part and prompt_tokens_details.cached_tokens names it. Converse's
+    # inputTokens excludes cache reads and writes.
+    resp = {**_CONVERSE_RESP, "usage": {"inputTokens": 6, "outputTokens": 5, "totalTokens": 392739,
+                                        "cacheReadInputTokens": 233612,
+                                        "cacheWriteInputTokens": 159116}}
+    usage = bedrock.converse_to_openai(resp, "claude-opus-5", "id", 0)["usage"]
+    assert usage["prompt_tokens"] == 6 + 233612 + 159116
+    assert usage["prompt_tokens_details"] == {"cached_tokens": 233612}
+    assert usage["cache_read_input_tokens"] == 233612
+    assert usage["cache_write_input_tokens"] == 159116
+
+
 def test_reasoning_content_surfaced():
     resp = {
         "output": {"message": {"content": [

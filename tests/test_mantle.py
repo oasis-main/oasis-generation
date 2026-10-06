@@ -76,7 +76,56 @@ def test_responses_to_openai_shape():
     assert out["model"] == "gpt-5.6-sol"
     assert out["choices"][0]["message"] == {"role": "assistant", "content": "42"}
     assert out["choices"][0]["finish_reason"] == "stop"
-    assert out["usage"] == {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+    assert out["usage"] == {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25,
+                            "prompt_tokens_details": {"cached_tokens": 0}}
+
+
+def test_responses_usage_carries_cached_share():
+    resp = {
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+        "status": "completed",
+        "usage": {"input_tokens": 1000, "input_tokens_details": {"cached_tokens": 900},
+                  "output_tokens": 5, "total_tokens": 1005},
+    }
+    usage = mantle.responses_to_openai(resp, "m", "id", 0)["usage"]
+    assert usage["prompt_tokens"] == 1000  # Responses input already includes cached
+    assert usage["prompt_tokens_details"] == {"cached_tokens": 900}
+
+
+def _stream_frames(monkeypatch, body):
+    import asyncio
+    import json
+
+    async def fake_complete(model_id, body, region, public_id, defaults=None):
+        return mantle.responses_to_openai({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "status": "completed",
+            "usage": {"input_tokens": 50, "output_tokens": 2, "total_tokens": 52},
+        }, public_id, "chatcmpl-x", 0)
+
+    monkeypatch.setattr(mantle, "complete", fake_complete)
+
+    async def collect():
+        return [c async for c in mantle.stream("m", body, "us-east-1", "gpt-5.6-sol")]
+
+    frames = []
+    for c in asyncio.run(collect()):
+        line = c.decode().strip()[len("data: "):]
+        if line != "[DONE]":
+            frames.append(json.loads(line))
+    return frames
+
+
+def test_stream_sends_usage_when_asked(monkeypatch):
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True,
+            "stream_options": {"include_usage": True}}
+    frames = _stream_frames(monkeypatch, body)
+    assert frames[-1]["usage"]["prompt_tokens"] == 50
+
+
+def test_stream_omits_usage_when_not_asked(monkeypatch):
+    frames = _stream_frames(monkeypatch, {"messages": [{"role": "user", "content": "x"}], "stream": True})
+    assert not any("usage" in f for f in frames)
 
 
 def test_incomplete_maps_to_length():

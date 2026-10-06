@@ -277,10 +277,15 @@ def responses_to_openai(resp: dict, public_id: str, completion_id: str, created:
                 "finish_reason": "tool_calls" if tool_calls else _finish_reason(resp),
             }
         ],
+        # Responses' input_tokens already include cached tokens (OpenAI
+        # convention), so only the cached share needs carrying across.
         "usage": {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
+            "prompt_tokens_details": {
+                "cached_tokens": (usage.get("input_tokens_details") or {}).get("cached_tokens", 0) or 0,
+            },
         },
     }
 
@@ -337,5 +342,10 @@ async def stream(
             "type": "function",
             "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
         }]}))
-    yield _sse(chunk({}, choice["finish_reason"]))
+    final = chunk({}, choice["finish_reason"])
+    # Same contract as bedrock.stream: usage rides the last chunk when the
+    # caller asked for it (openclaw does, via compat.supportsUsageInStreaming).
+    if (body.get("stream_options") or {}).get("include_usage") and result.get("usage"):
+        final["usage"] = result["usage"]
+    yield _sse(final)
     yield b"data: [DONE]\n\n"

@@ -303,6 +303,30 @@ CATALOG: list[CatalogEntry] = [
         "deep effort capped at high; ~30% heavier tokenizer, hence the roomier max_tokens. "
         "Temperature removed (400s).",
     ),
+    CatalogEntry(
+        public_id="claude-sonnet-5-5",
+        upstream_id="us.anthropic.claude-sonnet-5-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Sonnet 5.5 via Bedrock (added 2026-10-07). Inference policy "
+        "mirrors Sonnet 5. Inference profile listed in us-east-1 and a raw Converse call "
+        "returned HTTP 200 (2026-10-07); the gateway-path call then returned AccessDenied for "
+        "aws-marketplace:ViewSubscriptions/Subscribe. Same one-time Marketplace subscription "
+        "by an admin principal as Opus 5.5; the invoker keeps no marketplace rights.",
+    ),
+    CatalogEntry(
+        public_id="claude-haiku-5-5",
+        upstream_id="us.anthropic.claude-haiku-5-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Haiku 5.5 via Bedrock (added 2026-10-07). Unlike Haiku 4.5, it "
+        "accepted the adaptive-thinking block on the gateway path (HTTP 200, 2026-10-07); the "
+        "next call was AccessDenied pending the same Marketplace subscription as Sonnet 5.5.",
+    ),
     # ---- Cheaper tier (ADM-052, added 2026-08-28) -------------------------
     # Every entry below was probed live against this account BEFORE being
     # enabled — see the analysis/ tooling. Two candidates were REJECTED and are

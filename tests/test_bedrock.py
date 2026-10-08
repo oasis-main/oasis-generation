@@ -322,7 +322,7 @@ def test_adaptive_claude_injects_thinking_and_strips_sampling():
     }
     kw = bedrock.openai_to_converse(body, _inference("claude-opus-4-8"))
     amrf = kw["additionalModelRequestFields"]
-    assert amrf["thinking"] == {"type": "adaptive"}
+    assert amrf["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert amrf["output_config"] == {"effort": "high"}  # balanced default
     assert "temperature" not in kw["inferenceConfig"]
     assert "topP" not in kw["inferenceConfig"]

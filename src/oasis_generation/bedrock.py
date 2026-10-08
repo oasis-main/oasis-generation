@@ -496,7 +496,13 @@ def openai_to_converse(
     # inject nothing so the model's own default behaviour stands.
     amrf: dict[str, Any] = {}
     if thinking_mode == "adaptive":
-        amrf["thinking"] = {"type": "adaptive"}
+        # display "summarized": without it Bedrock returns NO thinking text, so
+        # clients (openclaw /reasoning, the Fleet Observatory) see an empty
+        # reasoning block, and a long think streams nothing (idle watchdogs
+        # fire). Accepted by every adaptive model in the catalog (live probe
+        # 2026-10-08: opus 4.7/4.8/5/5.5, sonnet 4.6/5/5.5, haiku 5.5); output
+        # tokens unchanged; the summary arrives as reasoningContent deltas.
+        amrf["thinking"] = {"type": "adaptive", "display": "summarized"}
     if thinking_on and effort:
         amrf["output_config"] = {"effort": effort}
     if amrf:

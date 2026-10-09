@@ -81,7 +81,12 @@ def _resolve_inference(
         effort = _EFFORT_ALIASES.get(str(requested_effort).lower(), effort)
 
     # max_tokens: explicit request wins, else the profile, else the flat default.
-    max_tokens = int(body.get("max_tokens") or profile_max or _DEFAULT_MAX_TOKENS)
+    # openclaw sends `max_completion_tokens` to a custom OpenAI-compatible
+    # endpoint (openai-completions-compat.ts maxTokensField), not `max_tokens`.
+    # Reading only `max_tokens` silently dropped every bot to the 16000
+    # balanced profile, and Opus 5.5 spent it all on thinking (2026-10-09).
+    requested_max = body.get("max_tokens") or body.get("max_completion_tokens")
+    max_tokens = int(requested_max or profile_max or _DEFAULT_MAX_TOKENS)
     return thinking, effort, max_tokens, allow_temp, allow_samp
 
 # Converse stopReason -> OpenAI finish_reason.

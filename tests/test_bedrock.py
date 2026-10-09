@@ -360,6 +360,15 @@ def test_explicit_max_tokens_overrides_profile():
     assert kw["inferenceConfig"]["maxTokens"] == 500
 
 
+def test_max_completion_tokens_overrides_profile():
+    # openclaw's openai-completions transport sends this spelling, not max_tokens.
+    kw = bedrock.openai_to_converse(
+        {"messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 32000},
+        _inference("claude-opus-4-8"),
+    )
+    assert kw["inferenceConfig"]["maxTokens"] == 32000
+
+
 def test_native_model_injects_nothing_and_keeps_temperature():
     kw = bedrock.openai_to_converse(
         {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.3},

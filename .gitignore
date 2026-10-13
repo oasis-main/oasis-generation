@@ -4,5 +4,15 @@ __pycache__/
 .venv/
 .pytest_cache/
 .env
+# Every variant of an env file holds secrets (backups such as .env.bak-*
+# sat untracked and unignored in docker/ until 2026-10-13). Only the
+# example template is versioned.
+.env.*
+!.env.example
 models/
 usage/
+
+# Terraform working state: provider binaries and backend config, never versioned.
+.terraform/
+*.tfstate
+*.tfstate.*

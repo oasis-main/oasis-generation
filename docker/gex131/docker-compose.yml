@@ -1,0 +1,146 @@
+# GEN-008 GEX131 serving project. FILES ONLY: nothing here has been applied.
+# Infra goes through Yes Man (INFRA-REQUEST); see docs/gex131/README.md.
+#
+#   docker compose -f docker/gex131/docker-compose.yml --env-file docker/gex131/.env config   # validate
+#
+# Rules this file enforces (tests/test_gex131_compose.py checks them):
+#   1. Every image is `${VAR:?...}` and must resolve to repo@sha256:<digest>. No tags, no :latest.
+#      Compose refuses to start if a digest variable is unset.
+#   2. No public port. The only published port is the gateway on 127.0.0.1.
+#   3. Only the gateway has internet egress (Bedrock, BYOK). Everything else is on an
+#      `internal: true` network and loads weights from the mounted /models volume only.
+#   4. No secret value in this file. Postgres password comes from a file-backed secret.
+#   5. No weights in any image; /models is a mounted volume, read-only for every consumer.
+name: gen008-gex131
+
+x-offline: &offline
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+
+services:
+  gateway:
+    image: ${GATEWAY_IMAGE:?set GATEWAY_IMAGE to repo@sha256:digest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8800:8800"          # loopback only; reach it over the private link, never publicly
+    env_file:
+      - path: .env.gateway             # service tokens, AWS keys: file is gitignored, never in this repo
+        required: false
+    environment:
+      OASIS_GENERATION_ROUTES_FILE: /config/routes.yaml
+      OASIS_GENERATION_DECIDER_URL: http://decider:8790/v1/decide
+      OASIS_GENERATION_USAGE_LOG: /usage/requests.jsonl
+    volumes:
+      - ./routes.gex131.yaml:/config/routes.yaml:ro
+      - usage:/usage
+    depends_on:
+      vllm: {condition: service_healthy}
+      decider: {condition: service_healthy}
+    networks: [internal, egress]
+    mem_limit: 1g
+
+  vllm:
+    image: ${VLLM_IMAGE:?set VLLM_IMAGE to repo@sha256:digest}
+    restart: unless-stopped
+    environment: *offline
+    command:
+      - --model=/models/gemma-4-12b-agentic          # path under the mounted volume; no download
+      - --served-model-name=gemma-4-12b-agentic
+      - --dtype=bfloat16
+      - --enable-lora
+      - --max-loras=${VLLM_MAX_LORAS:-4}
+      - --max-lora-rank=${VLLM_MAX_LORA_RANK:-64}
+      - --gpu-memory-utilization=${VLLM_GPU_FRACTION:-0.55}   # PLACEHOLDER: tune against the real card; embeddings share the GPU
+      - --max-model-len=${VLLM_MAX_LEN:-32768}
+      - --host=0.0.0.0
+      - --port=8000
+    volumes:
+      - models:/models:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    networks: [internal]
+
+  decider:
+    # X service: the oasis-decider sidecar (Laya typed decisions, CPU). Image built by oasis-claw; digest supplied by Yes Man.
+    image: ${DECIDER_IMAGE:?set DECIDER_IMAGE to repo@sha256:digest}
+    restart: unless-stopped
+    environment:
+      <<: *offline
+      DECIDER_MODEL_DIR: /models/laya-typed-decisions
+    volumes:
+      - models:/models:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8790/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks: [internal]
+    mem_limit: 4g
+
+  embed:
+    image: ${EMBED_IMAGE:?set EMBED_IMAGE to repo@sha256:digest}     # text-embeddings-inference (or equivalent)
+    restart: unless-stopped
+    environment: *offline
+    command: ["--model-id=/models/bge-m3", "--port=8080"]
+    volumes:
+      - models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    networks: [internal]
+
+  rerank:
+    image: ${RERANK_IMAGE:?set RERANK_IMAGE to repo@sha256:digest}
+    restart: unless-stopped
+    environment: *offline
+    command: ["--model-id=/models/bge-reranker-v2-m3", "--port=8080"]
+    volumes:
+      - models:/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]
+    networks: [internal]
+
+  postgres:
+    image: ${PGVECTOR_IMAGE:?set PGVECTOR_IMAGE to repo@sha256:digest}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gen008
+      POSTGRES_USER: gen008
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+    secrets: [pg_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gen008 -d gen008"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+networks:
+  internal:
+    internal: true        # no route to the internet
+  egress: {}              # gateway only
+
+volumes:
+  models:
+    external: true        # pre-staged, read-only to consumers; populated from the Storage Box by Yes Man, not by these containers
+    name: gen008_models
+  pgdata: {}
+  usage: {}
+
+secrets:
+  pg_password:
+    file: ./secrets/pg_password   # created on the host by the operator; gitignored; never committed

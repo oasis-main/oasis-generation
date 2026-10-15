@@ -1,0 +1,13 @@
+# GEX131 route table: service names match docker/gex131/docker-compose.yml.
+# Region is declared "eu" because the box is in Hetzner fsn1; bedrock:default is us-east-1,
+# so an EU-residency tenant is never routed there (see routes.py).
+pools:
+  gex131-vllm: {base_url: "http://vllm:8000/v1", region: eu}
+bedrock:
+  default: {region: us-east-1}
+  eu:      {region: eu-central-1}
+tenants:
+  "*": {residency: any, fallback: allowed}
+routes:
+  - {tenant: "*", model: gemma-4-12b-agentic, targets: ["own:gex131-vllm", "bedrock:default"]}
+  - {tenant: "*", model: "*",                 targets: ["bedrock:default"]}

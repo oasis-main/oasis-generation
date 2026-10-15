@@ -180,6 +180,49 @@ class ByokRegistry:
         finally:
             await client.aclose()
 
+    # ---- forwarding (real traffic) ---------------------------------------
+    def forward_ready(self, name: str) -> ByokEntry:
+        prov = self.get(name)
+        if prov.status != "active":
+            raise ByokError(f"byok provider {name!r} is {prov.status}, not active")
+        if prov.entry.kind != "openai_compat":
+            # anthropic / bedrock_role need request translation that is not built yet.
+            raise ByokError(f"forwarding for kind {prov.entry.kind!r} is not implemented")
+        return prov.entry
+
+    async def forward(self, name: str, body: dict) -> tuple[int, dict | str]:
+        """Non-streaming chat completion through an ACTIVE openai_compat provider.
+        SSRF-checked and IP-pinned on every call."""
+        entry = self.forward_ready(name)
+        body = {**body, "model": entry.model or body.get("model")}
+        code, resp = await self._post(entry, body)
+        try:
+            return code, resp.json()
+        except ValueError:
+            return code, resp.text[:200]
+
+    async def forward_stream(self, name: str, body: dict):
+        """Async generator of raw SSE bytes. The SSRF check happens before the
+        first byte is requested."""
+        entry = self.forward_ready(name)
+        body = {**body, "model": entry.model or body.get("model"), "stream": True}
+        args, _ = self.prepare(entry)
+        url = args.pop("url")
+        args.pop("follow_redirects", None)
+        client = self._client()
+        try:
+            req = client.build_request("POST", url, json=body, **args)
+            resp = await client.send(req, stream=True)
+            try:
+                if 300 <= resp.status_code < 400:
+                    raise ByokError(f"upstream redirected ({resp.status_code}); not followed")
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()
+        finally:
+            await client.aclose()
+
     # ---- conformance ------------------------------------------------------
     def _body(self, entry: ByokEntry, *, stream=False, tool=False) -> dict:
         prompt = "Reply with the single word: ok"

@@ -19,9 +19,13 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import bedrock, mantle
+from pydantic import BaseModel
+
+from . import bedrock, mantle, wiring
+from .byok import ByokError
 from .catalog import CatalogEntry, enabled_models, resolve
 from .config import Settings, get_settings
+from .routes import NoRoute, Target
 
 app = FastAPI(title="oasis-generation", version="0.0.1")
 
@@ -208,9 +212,89 @@ def _logged_stream(request: Request, entry: CatalogEntry, gen) -> StreamingRespo
     return StreamingResponse(gen, media_type="text/event-stream")
 
 
+async def _dispatch_target(tg: Target, body: dict, entry: CatalogEntry | None,
+                           table, settings: Settings, request: Request):
+    """Send one request to one route-table target. Raises on failure so the
+    caller can try the next target; returns a Response on success."""
+    model = body.get("model", "")
+    # Calls through byok/remote need no catalog entry; give logging a stand-in.
+    ent = entry or CatalogEntry(public_id=model, upstream_id=model, tier="routed", enabled=True)
+    if tg.kind == "own":
+        ep = table.endpoint(tg)
+        key = os.environ.get(ep.api_key_env or "", "").strip() if ep.api_key_env else ""
+        if ep.api_key_env and not key:
+            raise HTTPException(502, f"{tg}: {ep.api_key_env} not set on the gateway")
+        return await _proxy_openai_compatible(
+            body, ent, ep.base_url, settings, {"Authorization": f"Bearer {key}"} if key else None, request)
+    if tg.kind == "remote":
+        ep = table.endpoint(tg)
+        key = os.environ.get(ep.api_key_env or "", "").strip() if ep.api_key_env else ""
+        # The remote gateway resolves the public id itself: keep it, do not map to upstream_id.
+        remote_ent = ent.model_copy(update={"upstream_id": model})
+        return await _proxy_openai_compatible(
+            body, remote_ent, ep.base_url, settings, {"Authorization": f"Bearer {key}"} if key else None, request)
+    if tg.kind == "bedrock":
+        if entry is None or entry.backend != "bedrock":
+            raise HTTPException(502, f"{tg}: model {model!r} has no bedrock catalog entry")
+        region = table.data.bedrock[tg.name].region
+        if body.get("stream"):
+            return _logged_stream(request, entry, bedrock.stream(
+                entry.upstream_id, body, region, entry.public_id, entry.inference))
+        payload = await bedrock.complete(entry.upstream_id, body, region, entry.public_id, entry.inference)
+        return _logged_json(request, entry, payload)
+    if tg.kind == "byok":
+        reg = wiring.byok(settings)
+        try:
+            if body.get("stream"):
+                reg.forward_ready(tg.name)  # fail before returning a stream
+                return _logged_stream(request, ent, reg.forward_stream(tg.name, body))
+            code, payload = await reg.forward(tg.name, body)
+        except ByokError as exc:
+            raise HTTPException(502, f"{tg}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(502, f"{tg}: non-JSON upstream body (HTTP {code})")
+        payload["model"] = model
+        if code == 200:
+            return _logged_json(request, ent, payload)
+        return JSONResponse(payload, status_code=code)
+    raise HTTPException(500, f"unhandled target kind {tg.kind}")
+
+
+async def _routed_chat(request: Request, body: dict, settings: Settings, table_holder):
+    table = table_holder.current()
+    # Tenant = the caller name the service token maps to (ADM-050 attribution).
+    tenant = _client_of(request)
+    model = body.get("model", "")
+    try:
+        resolved = table.resolve(tenant, model)
+    except NoRoute as exc:
+        # 422, not 404/502: the request is understood but the tenant's limits
+        # (residency/fallback) leave nowhere legal to send it.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    entry = resolve(model)
+    last: Exception | None = None
+    for i, tg in enumerate(resolved.targets):
+        try:
+            resp = await _dispatch_target(tg, body, entry, table, settings, request)
+            if getattr(resp, "status_code", 200) >= 500 and i + 1 < len(resolved.targets):
+                last = HTTPException(resp.status_code, f"{tg} returned {resp.status_code}")
+                continue
+            return resp
+        except HTTPException as exc:
+            last = exc
+        except Exception as exc:  # noqa: BLE001 - boto/network errors -> try the next target
+            last = exc
+        # Streams are not retried once they started; failures above happen before that.
+    detail = getattr(last, "detail", None) or str(last)
+    raise HTTPException(status_code=502, detail=f"all targets failed for {model!r}: {detail}")
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_completions(request: Request, settings: Settings = Depends(get_settings)):
     body = await request.json()
+    table_holder = wiring.routes(settings)
+    if table_holder is not None:
+        return await _routed_chat(request, body, settings, table_holder)
     entry = resolve(body.get("model", ""))
     if entry is None:
         raise HTTPException(status_code=404, detail=f"unknown or disabled model: {body.get('model')!r}")
@@ -268,3 +352,47 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
     return await _proxy_openai_compatible(
         body, entry, settings.upstream_base_url, settings, None, request
     )
+
+
+# ---- X endpoints (GEN-008) -------------------------------------------------
+class DecideIn(BaseModel):
+    model: str
+    labelset_id: str
+    ctx: dict | list | str | None = None
+
+
+class GateIn(BaseModel):
+    model: str
+    action: dict
+    ctx: dict | list | str | None = None
+    baseline: str | None = None   # tighten-only floor; absent = "escalate"
+
+
+@app.post("/v1/x/decide", dependencies=[Depends(check_auth)])
+async def x_decide(body: DecideIn, settings: Settings = Depends(get_settings)):
+    """Stateless X call. Returns the x_decision record; failures abstain, never 5xx."""
+    try:
+        return await wiring.xservice(settings).decide(
+            model=body.model, labelset_id=body.labelset_id, ctx=body.ctx)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'\"")) from exc
+
+
+@app.post("/v1/gate", dependencies=[Depends(check_auth)])
+async def x_gate(body: GateIn, settings: Settings = Depends(get_settings)):
+    """Verdict on a proposed side effect. Restrictive-only; fails closed to escalate."""
+    try:
+        return await wiring.xservice(settings).gate(
+            model=body.model, action=body.action, ctx=body.ctx, baseline=body.baseline)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/v1/byok/{name}/conformance", dependencies=[Depends(check_auth)])
+async def byok_conformance(name: str, settings: Settings = Depends(get_settings)):
+    """Run the four-check conformance run; the provider becomes routable only on a pass."""
+    reg = wiring.byok(settings)
+    try:
+        return await reg.run_conformance(name)
+    except ByokError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

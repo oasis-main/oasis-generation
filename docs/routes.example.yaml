@@ -1,0 +1,20 @@
+# GEN-008 route table. Point OASIS_GENERATION_ROUTES_FILE at a copy of this.
+# Unset = legacy catalog routing (nothing below applies).
+# Tenant = the caller name from OASIS_GENERATION_SERVICE_TOKENS ("name:token").
+# Targets are tried in order; first success wins. Hot reloaded on file change;
+# a broken edit keeps the previous table and is visible in HotRouteTable.last_error.
+
+pools:                       # own: self-hosted OpenAI-compatible engines, one URL each
+  gex131-vllm:  {base_url: "http://vllm:8000/v1", region: eu}
+  scw-l40s:     {base_url: "http://scw-runner:8000/v1", region: eu-fr}
+bedrock:                     # bedrock: profile = region (+ optional role)
+  default:      {region: us-east-1}
+  eu:           {region: eu-central-1}
+remotes:                     # remote: another oasis-generation gateway (the VM)
+  hetzner-vm:   {base_url: "https://gw.example.internal/v1", region: eu, api_key_env: VM_GATEWAY_TOKEN}
+tenants:
+  "*":          {residency: any, fallback: allowed}
+  acme:         {residency: eu,  fallback: never}     # never leaves the EU, no failover
+routes:
+  - {tenant: "*", model: gemma-4-12b-agentic, targets: ["own:gex131-vllm", "own:scw-l40s", "bedrock:default"]}
+  - {tenant: "*", model: "*",                 targets: ["bedrock:default"]}

@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # holds them, the bots never do.
     bedrock_region: str = "us-east-1"
 
+    # GEN-008. All optional; with none set the gateway behaves exactly as before.
+    # Route table (routes.yaml, hot reloaded). Empty = legacy catalog routing.
+    routes_file: str = ""
+    # BYOK providers loaded (as "pending") at startup; activated only by a passing
+    # conformance run (POST /v1/byok/{name}/conformance).
+    byok_file: str = ""
+    # Extra X label sets (yaml list of LabelSet); gate.v1 is built in.
+    labelsets_file: str = ""
+    # The decider sidecar behind /v1/x/decide and /v1/gate.
+    decider_url: str = "http://oasis-decider:8790/v1/decide"
+    x_timeout_s: float = 10.0
+
     model_config = {"env_prefix": "OASIS_GENERATION_"}
 
     @property

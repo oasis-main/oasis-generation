@@ -157,6 +157,19 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              scale). Sovereignty: keep on EU/Scaleway; note AI-Act GPAI
              exposure. Do NOT provision until a concrete experiment is scoped.
 
+- [ ] [GEN-008] [OPEN 2026-10-15] Serving platform v1: GEX131 essentials, Scaleway single GPU, gateway hosting + routing (own / Bedrock / BYOK), local-vs-cloud switch
+      priority: high | project: serving-platform | division: GEN
+      notes: Plan = oasis-x/.swarm/GENERATIVE_PLAN.md §11 (work items in §11.7).
+             Builder: Kolmogorov (clone bot-work/kolmogorov/oasis-generation; his
+             design docs/OX-MODELS-INTERFACE-TRAINING-DESIGN.md, 9d3980f). Infra: Yes Man.
+             Mike: order the GEX131 (Robot panel) + Robot webservice credential for
+             Yes Man; validate identity on the hello@ Scaleway org (unlocks quota 1 for
+             L40S-1-48G, then GEN-001 under INFRA-0002); pick the gateway host (§11.4,
+             recommendation: ECS Fargate eu-central-1 for customers, Mac kept for the fleet).
+             Code first, no infra: route table + hot reload + X-Oasis-Route, BYOK registry
+             + conformance run + SSRF guard, /v1/x/decide + /v1/gate.
+             Pin vllm/vllm-openai by digest before any box runs it (Dockerfile.runner uses :latest).
+
 - [/] [GEN-007] [PHASE 0 LIVE 2026-10-07 · audit pass 1 DONE] Decision models: audit queue, fine-tune, placement
       priority: medium | project: decision-models | division: GEN
       notes: Plan = oasis-x/.swarm/GENERATIVE_PLAN.md §10. Sidecar + reviewer

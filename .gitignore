@@ -11,6 +11,7 @@ __pycache__/
 !.env.example
 models/
 usage/
+state/
 
 # Terraform working state: provider binaries and backend config, never versioned.
 .terraform/

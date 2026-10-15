@@ -9,11 +9,15 @@ request by the resolved catalog entry's `backend` (GEN-003 provider fanout):
                      (per-entry base_url + bearer key).
   - bedrock       -> Amazon Bedrock via the Converse API (see bedrock.py).
 
+Before any of that, a caller switched to "remote" (remote.py, GEN-008) is
+forwarded whole to the other gateway, and this gateway only records the call.
+
 Provider keys live only here (the gateway), so bot egress collapses to
 gateway + Telegram. Wake-on-request lands behind the same routes later (GEN-004).
 """
 
 import os
+import re
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -22,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from . import bedrock, mantle
 from .catalog import CatalogEntry, enabled_models, resolve
 from .config import Settings, get_settings
+from .remote import TARGETS, RouteStore, read_secret_file, token_matches
 
 app = FastAPI(title="oasis-generation", version="0.0.1")
 
@@ -38,6 +43,25 @@ def check_auth(request: Request, settings: Settings = Depends(get_settings)) -> 
     # Attribution rides on the request from here (ADM-050). The token is NOT
     # stored anywhere — only the name it maps to.
     request.state.client = clients[token]
+    # A gateway that forwards a bot's call (remote.py) names the bot here, so
+    # this gateway's ledger can say which bot behind that gateway called.
+    # Informational only: it never changes auth or routing.
+    origin = request.headers.get("x-oasis-origin-client", "")
+    if _CLIENT_NAME.fullmatch(origin):
+        request.state.origin_client = origin
+
+
+_CLIENT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
+
+
+@app.middleware("http")
+async def _served_by_header(request: Request, call_next):
+    """Every model response says which gateway served it (GEN-008 §11.6)."""
+    response = await call_next(request)
+    served = getattr(request.state, "served_by", None)
+    if served:
+        response.headers["X-Oasis-Served-By"] = served
+    return response
 
 
 # Per-request usage log (ADM-050). One JSONL line per call: who, which model,
@@ -48,7 +72,15 @@ USAGE_LOG = os.environ.get("OASIS_GENERATION_USAGE_LOG", "/usage/requests.jsonl"
 
 
 def _record_usage(
-    client: str, entry: CatalogEntry, usage: dict | None, streamed: bool, status: int
+    client: str, entry: CatalogEntry, usage: dict | None, streamed: bool, status: int,
+    origin_client: str | None = None,
+) -> None:
+    _record_usage_raw(client, entry.public_id, entry.backend, usage, streamed, status, origin_client)
+
+
+def _record_usage_raw(
+    client: str, model: str, backend: str, usage: dict | None, streamed: bool, status: int,
+    origin_client: str | None = None,
 ) -> None:
     """Append one usage record. Never raises: a cost-ledger write must not be
     able to fail a model call the caller is waiting on."""
@@ -60,8 +92,8 @@ def _record_usage(
         rec = {
             "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "client": client,
-            "model": entry.public_id,
-            "backend": entry.backend,
+            "model": model,
+            "backend": backend,
             "status": status,
             "streamed": streamed,
             # Absent on streamed calls whose backend omits a usage block; left
@@ -73,6 +105,8 @@ def _record_usage(
                 or u.get("cache_read_input_tokens")
             ),
         }
+        if origin_client:
+            rec["origin_client"] = origin_client
         path = USAGE_LOG
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
@@ -87,7 +121,14 @@ def health() -> dict:
 
 
 @app.get("/v1/models", dependencies=[Depends(check_auth)])
-def list_models() -> dict:
+async def list_models(request: Request, settings: Settings = Depends(get_settings)):
+    if _route_of(request, settings) == "remote":
+        return await _forward_remote(request, settings, "GET", "/models", None)
+    request.state.served_by = "local"
+    return _local_models()
+
+
+def _local_models() -> dict:
     # `capabilities` is an oasis-generation extension to the OpenAI model object
     # (standard clients ignore unknown fields); it drives the Telegram /genconfig
     # surface so each model shows only the controls it actually supports (§7.7).
@@ -180,7 +221,7 @@ async def _proxy_openai_compatible(
         _record_usage(
             _client_of(request), entry,
             payload.get("usage") if isinstance(payload, dict) else None,
-            streamed=False, status=resp.status_code,
+            streamed=False, status=resp.status_code, origin_client=_origin_of(request),
         )
     return JSONResponse(payload, status_code=resp.status_code)
 
@@ -189,10 +230,156 @@ def _client_of(request: Request) -> str:
     return getattr(request.state, "client", "unknown")
 
 
+def _origin_of(request: Request) -> str | None:
+    return getattr(request.state, "origin_client", None)
+
+
+# ── Per-client route switch (GEN-008, remote.py) ────────────────────────────
+
+# Tests swap this for an httpx.MockTransport; production leaves it None.
+_remote_transport: httpx.AsyncBaseTransport | None = None
+
+
+def _store(settings: Settings) -> RouteStore:
+    return RouteStore(settings.route_state_file)
+
+
+def _route_of(request: Request, settings: Settings) -> str:
+    # A call that already came through another gateway is never forwarded
+    # again: two gateways pointed at each other would otherwise loop.
+    if _origin_of(request):
+        return "local"
+    return _store(settings).get(_client_of(request))
+
+
+async def _forward_remote(
+    request: Request, settings: Settings, method: str, path: str, body: dict | None
+):
+    """Forward one call, unchanged, to the remote gateway. No fallback."""
+    request.state.served_by = "remote"
+    client_name = _client_of(request)
+    model = (body or {}).get("model", "") if body else ""
+    token = read_secret_file(settings.remote_token_file)
+    if not settings.remote_base_url.startswith("https://") or not token:
+        raise HTTPException(
+            status_code=502,
+            detail=f"client {client_name!r} is routed to the remote gateway, but no remote "
+            "gateway is configured on this gateway. Switch it back to local.",
+        )
+    url = f"{settings.remote_base_url.rstrip('/')}{path}"
+    headers = {"Authorization": f"Bearer {token}", "X-Oasis-Origin-Client": client_name}
+    client = httpx.AsyncClient(timeout=settings.upstream_timeout_s, transport=_remote_transport)
+
+    if body is not None and body.get("stream"):
+        upstream = client.stream(method, url, json=body, headers=headers)
+
+        async def relay():
+            try:
+                async with upstream as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+            finally:
+                await client.aclose()
+
+        _record_usage_raw(client_name, model, "remote", None, True, 200, _origin_of(request))
+        return StreamingResponse(relay(), media_type="text/event-stream")
+
+    try:
+        resp = await client.request(method, url, json=body, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"remote gateway unreachable: {type(exc).__name__}"
+        ) from exc
+    finally:
+        await client.aclose()
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail=f"remote gateway returned a non-JSON body (HTTP {resp.status_code})",
+        ) from None
+    if body is not None:
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        _record_usage_raw(client_name, model, "remote", usage, False, resp.status_code, _origin_of(request))
+    return JSONResponse(payload, status_code=resp.status_code)
+
+
+def _known_clients(settings: Settings) -> list[str]:
+    return sorted(set(settings.token_clients.values()) - {"unattributed"})
+
+
+def _routing_view(settings: Settings) -> dict:
+    snap = _store(settings).snapshot()
+    return {
+        "targets": list(TARGETS),
+        "remote_configured": settings.remote_configured,
+        "remote_base_url": settings.remote_base_url or None,
+        "clients": {c: snap.get(c, "local") for c in _known_clients(settings)},
+    }
+
+
+def check_admin(request: Request, settings: Settings = Depends(get_settings)) -> None:
+    expected = read_secret_file(settings.admin_token_file)
+    if not expected:
+        raise HTTPException(status_code=503, detail="admin API disabled (no admin token file)")
+    presented = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+    if not token_matches(presented, expected):
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+
+def _parse_target(body: object, settings: Settings) -> str:
+    target = body.get("target") if isinstance(body, dict) else None
+    if target not in TARGETS:
+        raise HTTPException(status_code=400, detail=f"target must be one of {list(TARGETS)}")
+    if target == "remote" and not settings.remote_configured:
+        raise HTTPException(status_code=409, detail="no remote gateway is configured on this gateway")
+    return target
+
+
+@app.get("/admin/routing", dependencies=[Depends(check_admin)])
+def admin_routing(settings: Settings = Depends(get_settings)) -> dict:
+    return _routing_view(settings)
+
+
+@app.put("/admin/routing/{client_name}", dependencies=[Depends(check_admin)])
+async def admin_set_routing(
+    client_name: str, request: Request, settings: Settings = Depends(get_settings)
+) -> dict:
+    if client_name not in _known_clients(settings):
+        raise HTTPException(status_code=404, detail=f"unknown client {client_name!r}")
+    target = _parse_target(await request.json(), settings)
+    prev, new = _store(settings).set(client_name, target, actor="admin")
+    return {"client": client_name, "from": prev, "to": new}
+
+
+@app.get("/v1/routing/self", dependencies=[Depends(check_auth)])
+def self_routing(request: Request, settings: Settings = Depends(get_settings)) -> dict:
+    me = _client_of(request)
+    return {
+        "client": me,
+        "target": _store(settings).get(me),
+        "targets": list(TARGETS),
+        "remote_configured": settings.remote_configured,
+        "may_switch": settings.may_self_switch(me),
+    }
+
+
+@app.put("/v1/routing/self", dependencies=[Depends(check_auth)])
+async def self_set_routing(request: Request, settings: Settings = Depends(get_settings)) -> dict:
+    me = _client_of(request)
+    if not settings.may_self_switch(me):
+        raise HTTPException(status_code=403, detail=f"client {me!r} may not switch its own route")
+    target = _parse_target(await request.json(), settings)
+    prev, new = _store(settings).set(me, target, actor=f"self:{me}")
+    return {"client": me, "from": prev, "to": new}
+
+
 def _logged_json(request: Request, entry: CatalogEntry, payload: dict) -> JSONResponse:
     """Return the payload, recording its usage block on the way out."""
     usage = payload.get("usage") if isinstance(payload, dict) else None
-    _record_usage(_client_of(request), entry, usage, streamed=False, status=200)
+    _record_usage(_client_of(request), entry, usage, streamed=False, status=200,
+                  origin_client=_origin_of(request))
     return JSONResponse(payload)
 
 
@@ -204,13 +391,17 @@ def _logged_stream(request: Request, entry: CatalogEntry, gen) -> StreamingRespo
     A row with null tokens still gives call counts per bot per model, and the
     authoritative cost stays the CUR either way.
     """
-    _record_usage(_client_of(request), entry, None, streamed=True, status=200)
+    _record_usage(_client_of(request), entry, None, streamed=True, status=200,
+                  origin_client=_origin_of(request))
     return StreamingResponse(gen, media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_completions(request: Request, settings: Settings = Depends(get_settings)):
     body = await request.json()
+    if _route_of(request, settings) == "remote":
+        return await _forward_remote(request, settings, "POST", "/chat/completions", body)
+    request.state.served_by = "local"
     entry = resolve(body.get("model", ""))
     if entry is None:
         raise HTTPException(status_code=404, detail=f"unknown or disabled model: {body.get('model')!r}")

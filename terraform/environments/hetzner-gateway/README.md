@@ -9,7 +9,7 @@ Required variables: `gateway_hostname`, `acme_email`, `gateway_image` (digest-pi
 Gateway env / Bedrock credentials are NOT set here; they belong to the IAM plan.
 
 Unverified (no terraform or hcloud in my container; file was NOT validated):
-- hcloud provider pin 1.52.0 must match the mirror Yes Man uses.
+- hcloud provider pin 1.70.0 must match the mirror Yes Man uses.
 - server_type cx23/cx33 must exist in fsn1 (`hcloud server-type list`).
 - Run `terraform validate` before planning.
 

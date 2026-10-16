@@ -1,0 +1,44 @@
+#cloud-config
+# Gateway VM bootstrap. NO secrets here. Only 443 is exposed (firewall); the
+# gateway container is reachable only on the internal compose network.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+write_files:
+  - path: /opt/gateway/Caddyfile
+    permissions: "0644"
+    content: |
+      {
+        email ${acme_email}
+      }
+      ${gateway_hostname} {
+        tls {
+          issuer acme {
+            disable_http_challenge
+          }
+        }
+        reverse_proxy gateway:8800
+      }
+  - path: /opt/gateway/docker-compose.yml
+    permissions: "0644"
+    content: |
+      services:
+        gateway:
+          image: ${gateway_image}
+          restart: unless-stopped
+          expose: ["8800"]
+        caddy:
+          image: caddy:2
+          restart: unless-stopped
+          depends_on: [gateway]
+          ports:
+            - "443:443"
+          volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+      volumes:
+        caddy_data: {}
+runcmd:
+  - systemctl enable --now docker
+  - cd /opt/gateway && docker compose up -d

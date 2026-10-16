@@ -28,8 +28,19 @@ write_files:
           image: ${gateway_image}
           restart: unless-stopped
           expose: ["8800"]
+          environment:
+            # Fail closed: with no service tokens the gateway refuses to start (503).
+            OASIS_GENERATION_REQUIRE_AUTH: "1"
+          # Written AFTER boot (never by Terraform): OASIS_GENERATION_SERVICE_TOKENS,
+          # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Compose refuses to start
+          # the stack until this file exists.
+          env_file:
+            - path: /opt/gateway/secrets.env
+              required: true
+          volumes:
+            - ./usage:/usage
         caddy:
-          image: caddy:2
+          image: ${caddy_image}
           restart: unless-stopped
           depends_on: [gateway]
           ports:
@@ -41,4 +52,7 @@ write_files:
         caddy_data: {}
 runcmd:
   - systemctl enable --now docker
-  - cd /opt/gateway && docker compose up -d
+  - mkdir -p /opt/gateway/usage
+  # Expected to fail on first boot (secrets.env absent); the post-boot secret
+  # push runs `docker compose up -d` again. Do not fail cloud-init on it.
+  - cd /opt/gateway && (docker compose up -d || echo "waiting for /opt/gateway/secrets.env")

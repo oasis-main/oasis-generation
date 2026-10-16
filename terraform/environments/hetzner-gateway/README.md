@@ -12,3 +12,10 @@ Unverified (no terraform or hcloud in my container; file was NOT validated):
 - hcloud provider pin 1.52.0 must match the mirror Yes Man uses.
 - server_type cx23/cx33 must exist in fsn1 (`hcloud server-type list`).
 - Run `terraform validate` before planning.
+
+## Secrets and auth (review of 028fd9c)
+
+- The gateway runs with `OASIS_GENERATION_REQUIRE_AUTH=1` (needs origin/dev 1514d19 in the image): no tokens -> refuses to start, 503.
+- `/opt/gateway/secrets.env` is NOT written by Terraform or cloud-init. It holds `OASIS_GENERATION_SERVICE_TOKENS=fleet:<token>`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`. Compose (`env_file ... required: true`) will not start the stack without it. Delivery is Mike's decision (proposal: Mac-side script over SSH, 22 open to the Mac only during the push, then closed by an in-place firewall update); afterwards run `docker compose up -d` in /opt/gateway.
+- `caddy_image` and `gateway_image` are both required digests. Usage ledger persists in /opt/gateway/usage.
+- Open for Mike: gateway_image registry (proposal: GH Actions, linux/amd64, ghcr.io/oasis-main public), acme_email (proposal mike@oasis-x.io), hostname generation.dev.cloud.oasis-x.io. Before plan: `hcloud server-type list` to confirm cx23 in fsn1.

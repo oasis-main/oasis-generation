@@ -105,6 +105,15 @@ variable "gateway_image" {
   }
 }
 
+# Caddy image pinned by digest (plan 11.2: every image by digest).
+variable "caddy_image" {
+  type = string
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.caddy_image))
+    error_message = "caddy_image must be pinned by digest (@sha256:...)."
+  }
+}
+
 # ---------------------------------------------------------------- resources --
 
 resource "hcloud_ssh_key" "admin" {
@@ -153,6 +162,7 @@ resource "hcloud_server" "gateway" {
     gateway_hostname = var.gateway_hostname
     acme_email       = var.acme_email
     gateway_image    = var.gateway_image
+    caddy_image      = var.caddy_image
   })
 
   labels = {

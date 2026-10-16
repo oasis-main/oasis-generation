@@ -445,6 +445,7 @@ async def _dispatch_target(tg: Target, body: dict, entry: CatalogEntry | None,
     if tg.kind == "byok":
         reg = wiring.byok(settings)
         try:
+            reg.check_owner(tg.name, _client_of(request))   # S1: a key is used only for its owner
             if body.get("stream"):
                 reg.forward_ready(tg.name)  # fail before returning a stream
                 return _logged_stream(request, ent, reg.forward_stream(tg.name, body))
@@ -591,9 +592,12 @@ async def x_gate(body: GateIn, settings: Settings = Depends(get_settings)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@app.post("/v1/byok/{name}/conformance", dependencies=[Depends(check_auth)])
+@app.post("/v1/byok/{name}/conformance", dependencies=[Depends(check_admin)])
 async def byok_conformance(name: str, settings: Settings = Depends(get_settings)):
-    """Run the four-check conformance run; the provider becomes routable only on a pass."""
+    """Run the four-check conformance run; the provider becomes routable only on a pass.
+
+    ADMIN token only (review S1): the run spends the provider owner's key (4 billed
+    calls) and flips the provider to routable, so a service token must not reach it."""
     reg = wiring.byok(settings)
     try:
         return await reg.run_conformance(name)

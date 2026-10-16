@@ -29,7 +29,9 @@ this module stays free of boto3.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal
@@ -42,8 +44,16 @@ from . import ssrf
 Kind = Literal["openai_compat", "anthropic", "bedrock_role"]
 Status = Literal["pending", "active", "failed"]
 
+log = logging.getLogger("oasis_generation.byok")
+
 ANTHROPIC_VERSION = "2023-06-01"
-PROBE_TIMEOUT_S = 30.0
+PROBE_TIMEOUT_S = 30.0          # httpx per-operation timeout (connect/read gap)
+# S2: per-operation timeouts do not bound a slow-drip endpoint (1 byte / 29 s holds
+# a connection forever). These are TOTAL budgets and hard size caps per call.
+CALL_DEADLINE_S = 60.0          # whole plain call: connect + headers + full body
+STREAM_DEADLINE_S = 300.0       # whole streamed call, wall clock
+MAX_BODY_BYTES = 1 * 1024 * 1024
+MAX_STREAM_BYTES = 8 * 1024 * 1024
 
 
 class ByokError(RuntimeError):
@@ -58,6 +68,7 @@ class ByokEntry(BaseModel):
     region: str | None = None          # declared by the tenant; "eu" or "eu-*" counts as EU
     model: str | None = None           # model id used for the conformance probes
     role_arn: str | None = None        # bedrock_role only
+    tenant: str | None = None          # owner (S1); set by the operator/admin, never trusted from a caller
 
     @field_validator("key_ref")
     @classmethod
@@ -68,12 +79,30 @@ class ByokEntry(BaseModel):
         return v
 
 
+class _Body:
+    """A fully-read, size-capped upstream body with the bits of httpx.Response we use."""
+
+    def __init__(self, status_code: int, content: bytes, encoding: str = "utf-8") -> None:
+        self.status_code, self.content, self._enc = status_code, content, encoding
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(self._enc, "replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
 @dataclass
 class Provider:
     name: str
     entry: ByokEntry
     status: Status = "pending"
     report: dict = field(default_factory=dict)
+
+    @property
+    def owner(self) -> str | None:
+        return self.entry.tenant
 
 
 def _env_resolver(ref: str) -> str | None:
@@ -86,7 +115,9 @@ class ByokRegistry:
         key_resolver: Callable[[str], str | None] = _env_resolver,
         transport: httpx.AsyncBaseTransport | None = None,   # tests inject a MockTransport
         bedrock_runner: Callable[[ByokEntry], Awaitable[dict]] | None = None,
+        allowed_ports: frozenset[int] | set[int] = ssrf.DEFAULT_ALLOWED_PORTS,  # S3: operator-set
     ) -> None:
+        self._ports = frozenset(allowed_ports)
         self._p: dict[str, Provider] = {}
         self._resolve_key = key_resolver
         self._transport = transport
@@ -108,7 +139,7 @@ class ByokRegistry:
             if not entry.model:
                 raise ByokError(f"{entry.kind} requires model (used for conformance probes)")
             try:
-                ssrf.check_url(entry.base_url)
+                ssrf.check_url(entry.base_url, self._ports)
             except ssrf.SSRFError as exc:
                 raise ByokError(f"base_url refused: {exc}") from exc
         prov = Provider(name, entry)
@@ -120,6 +151,14 @@ class ByokRegistry:
             return self._p[name]
         except KeyError:
             raise ByokError(f"unknown byok provider {name!r}") from None
+
+    def check_owner(self, name: str, caller: str) -> None:
+        """S1: a provider holds its owner's key; only that owner's traffic may use it.
+        An entry with no tenant is operator-shared and open to any caller."""
+        owner = self.get(name).owner
+        if owner is not None and owner != "*" and owner != caller:
+            log.warning("byok %s: caller %r is not owner %r", name, caller, owner)
+            raise ByokError(f"byok provider {name!r} is not available to this caller")
 
     def active_names(self) -> set[str]:
         return {n for n, p in self._p.items() if p.status == "active"}
@@ -150,33 +189,48 @@ class ByokRegistry:
         immediately before EVERY outbound request, never cached."""
         base = (entry.base_url or "").rstrip("/") + self._path(entry)
         try:
-            pinned = ssrf.pin(base)
+            pinned = ssrf.pin(base, self._ports)
         except ssrf.SSRFError as exc:
-            raise ByokError(f"call refused: {exc}") from exc
+            # S5: the resolved address / range must not reach a caller (it maps the
+            # internal network). Detail goes to the log only.
+            log.warning("byok call refused for %s: %s", entry.base_url, exc)
+            raise ByokError("call refused: destination not allowed") from exc
         args = pinned.request_args()
         args["headers"] = {**args["headers"], **self._headers(entry)}
         return args, base
 
     async def _post(self, entry: ByokEntry, body: dict, stream: bool = False):
+        """One guarded POST under a TOTAL deadline and a byte cap (S2).
+        Returns (status, _Body) or, for stream=True, (status, list[str] lines)."""
+        try:
+            return await asyncio.wait_for(self._post_inner(entry, body, stream), CALL_DEADLINE_S)
+        except asyncio.TimeoutError:
+            raise ByokError("upstream did not finish within the call deadline") from None
+
+    async def _post_inner(self, entry: ByokEntry, body: dict, stream: bool):
         args, _ = self.prepare(entry)
         url = args.pop("url")
         args.pop("follow_redirects", None)
         client = self._client()
         try:
-            if stream:
-                req = client.build_request("POST", url, json=body, **args)
-                resp = await client.send(req, stream=True)
-                lines = []
-                async for line in resp.aiter_lines():
-                    lines.append(line)
-                    if len(lines) > 2000:
+            req = client.build_request("POST", url, json=body, **args)
+            resp = await client.send(req, stream=True)
+            try:
+                if 300 <= resp.status_code < 400:
+                    raise ByokError(f"upstream redirected ({resp.status_code}); redirects are not followed")
+                cap = MAX_STREAM_BYTES if stream else MAX_BODY_BYTES
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > cap:
+                        raise ByokError(f"upstream body exceeds {cap} bytes")
+                    if stream and buf.count(b"\n") > 2000:
                         break
+                if stream:
+                    return resp.status_code, buf.decode("utf-8", "replace").splitlines()
+                return resp.status_code, _Body(resp.status_code, bytes(buf), resp.encoding or "utf-8")
+            finally:
                 await resp.aclose()
-                return resp.status_code, lines
-            resp = await client.post(url, json=body, **args)
-            if 300 <= resp.status_code < 400:
-                raise ByokError(f"upstream redirected ({resp.status_code}); redirects are not followed")
-            return resp.status_code, resp
         finally:
             await client.aclose()
 
@@ -203,20 +257,43 @@ class ByokRegistry:
 
     async def forward_stream(self, name: str, body: dict):
         """Async generator of raw SSE bytes. The SSRF check happens before the
-        first byte is requested."""
+        first byte is requested. Wall-clock deadline and byte cap apply (S2)."""
         entry = self.forward_ready(name)
         body = {**body, "model": entry.model or body.get("model"), "stream": True}
         args, _ = self.prepare(entry)
         url = args.pop("url")
         args.pop("follow_redirects", None)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STREAM_DEADLINE_S
+
+        def left() -> float:
+            r = deadline - loop.time()
+            if r <= 0:
+                raise ByokError("upstream stream exceeded its deadline")
+            return r
+
         client = self._client()
         try:
             req = client.build_request("POST", url, json=body, **args)
-            resp = await client.send(req, stream=True)
+            try:
+                resp = await asyncio.wait_for(client.send(req, stream=True), left())
+            except asyncio.TimeoutError:
+                raise ByokError("upstream stream exceeded its deadline") from None
             try:
                 if 300 <= resp.status_code < 400:
                     raise ByokError(f"upstream redirected ({resp.status_code}); not followed")
-                async for chunk in resp.aiter_bytes():
+                it = resp.aiter_bytes().__aiter__()
+                total = 0
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(it.__anext__(), left())
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        raise ByokError("upstream stream exceeded its deadline") from None
+                    total += len(chunk)
+                    if total > MAX_STREAM_BYTES:
+                        raise ByokError("upstream stream exceeded its size cap")
                     yield chunk
             finally:
                 await resp.aclose()

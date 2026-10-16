@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     # BYOK providers loaded (as "pending") at startup; activated only by a passing
     # conformance run (POST /v1/byok/{name}/conformance).
     byok_file: str = ""
+    # Extra outbound ports for BYOK endpoints, comma list. Default: 443 only.
+    # Operator-set; a tenant cannot add a port (review S3).
+    byok_extra_ports: str = ""
     # Extra X label sets (yaml list of LabelSet); gate.v1 is built in.
     labelsets_file: str = ""
     # The decider sidecar behind /v1/x/decide and /v1/gate.

@@ -106,7 +106,7 @@ def test_public_dns_pins_ip_and_keeps_hostname(monkeypatch):
 
 def test_pin_nondefault_port_and_ipv6(monkeypatch):
     _stub_dns(monkeypatch, {"v6.example": ["2606:4700:4700::1111"]})
-    p = ssrf.pin("https://v6.example:8443/x")
+    p = ssrf.pin("https://v6.example:8443/x", allowed_ports={443, 8443})
     assert p.request_args()["url"] == "https://[2606:4700:4700::1111]:8443/x"
     assert p.request_args()["headers"]["Host"] == "v6.example:8443"
 
@@ -124,3 +124,24 @@ def test_bad_port_refused():
 
 def test_check_ip_ipv4_mapped_public_ok():
     ssrf.check_ip(ipaddress.ip_address("::ffff:8.8.8.8"))
+
+
+# ---- review S3 / S4 ----------------------------------------------------------
+@pytest.mark.parametrize("url", ["https://a.example:0/", "https://a.example:22/",
+                                 "https://a.example:6379/", "https://a.example:8443/"])
+def test_only_443_by_default(monkeypatch, url):
+    _stub_dns(monkeypatch, {"a.example": ["93.184.216.34"]})
+    with pytest.raises(SSRFError):
+        ssrf.pin(url)
+
+
+def test_operator_can_allow_a_port_but_never_port_zero(monkeypatch):
+    _stub_dns(monkeypatch, {"a.example": ["93.184.216.34"]})
+    assert ssrf.pin("https://a.example:8443/", allowed_ports={443, 8443}).port == 8443
+    with pytest.raises(SSRFError):
+        ssrf.pin("https://a.example:0/", allowed_ports={0, 443})   # 0 is refused in _parse
+
+
+def test_6to4_relay_anycast_refused():
+    with pytest.raises(SSRFError):
+        ssrf.check_ip(ipaddress.ip_address("192.88.99.1"))

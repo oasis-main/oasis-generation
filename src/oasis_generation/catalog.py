@@ -264,6 +264,35 @@ CATALOG: list[CatalogEntry] = [
         "live against Converse before this entry was added: HTTP 200, real token usage.",
     ),
     CatalogEntry(
+        public_id="claude-opus-5-5",
+        upstream_id="us.anthropic.claude-opus-5-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("xhigh"),
+        notes="Anthropic Claude Opus 5.5 via Bedrock (added 2026-09-28). Inference policy "
+        "mirrors Opus 5 (adaptive thinking, effort ladder, temperature removed). First "
+        "Converse call through this gateway's own bedrock.complete returned HTTP 200 with "
+        "real usage; the next calls were AccessDenied until the account's AWS Marketplace "
+        "subscription existed, because dev-bedrock-invoker (inline policy "
+        "bedrock-invoke-only) may not create one. An admin principal subscribes once per "
+        "account; the invoker keeps no marketplace rights.",
+    ),
+    CatalogEntry(
+        public_id="gpt-6-astra",
+        upstream_id="us.openai.gpt-6-astra",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        notes="OpenAI GPT-6 Astra via Bedrock CONVERSE (added 2026-09-28). NOT on the "
+        "bedrock-mantle Responses endpoint that serves GPT-5.6: mantle returns 404 'The model "
+        "openai.gpt-6-astra does not exist'. Converse returned HTTP 200. Inference block left "
+        "unset until its reasoning controls are probed on Converse; nothing is injected that "
+        "the model might reject. Retention: AWS lists GPT-6 Astra among the models whose "
+        "classifier-flagged traffic is kept up to 30 days for abuse detection (not shared "
+        "with OpenAI). Same Marketplace-subscription requirement as Opus 5.5.",
+    ),
+    CatalogEntry(
         public_id="claude-sonnet-5",
         upstream_id="us.anthropic.claude-sonnet-5",
         tier="bedrock",
@@ -273,6 +302,30 @@ CATALOG: list[CatalogEntry] = [
         notes="Anthropic Claude Sonnet 5 via Bedrock (added 2026-07-24). Adaptive thinking; "
         "deep effort capped at high; ~30% heavier tokenizer, hence the roomier max_tokens. "
         "Temperature removed (400s).",
+    ),
+    CatalogEntry(
+        public_id="claude-sonnet-5-5",
+        upstream_id="us.anthropic.claude-sonnet-5-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Sonnet 5.5 via Bedrock (added 2026-10-07). Inference policy "
+        "mirrors Sonnet 5. Inference profile listed in us-east-1 and a raw Converse call "
+        "returned HTTP 200 (2026-10-07); the gateway-path call then returned AccessDenied for "
+        "aws-marketplace:ViewSubscriptions/Subscribe. Same one-time Marketplace subscription "
+        "by an admin principal as Opus 5.5; the invoker keeps no marketplace rights.",
+    ),
+    CatalogEntry(
+        public_id="claude-haiku-5-5",
+        upstream_id="us.anthropic.claude-haiku-5-5",
+        tier="bedrock",
+        enabled=True,
+        backend="bedrock",
+        inference=_adaptive_claude("high"),
+        notes="Anthropic Claude Haiku 5.5 via Bedrock (added 2026-10-07). Unlike Haiku 4.5, it "
+        "accepted the adaptive-thinking block on the gateway path (HTTP 200, 2026-10-07); the "
+        "next call was AccessDenied pending the same Marketplace subscription as Sonnet 5.5.",
     ),
     # ---- Cheaper tier (ADM-052, added 2026-08-28) -------------------------
     # Every entry below was probed live against this account BEFORE being

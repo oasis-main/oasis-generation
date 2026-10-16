@@ -132,6 +132,61 @@ stay in oasis-x `.swarm/queue.md` under ORG numbers; see
              adapter+eval-report out. Modal is US-resident: disclose in ToS
              for v0, or use Modal EU region if plan allows.
 
+- [ ] [GEN-006] [OPEN — PLAN ONLY, do not implement yet] RL + fine-tuning on the archived open-model collection (dedicated big-machine reservations)
+      priority: low | project: finetune | division: GEN
+      notes: Source = the sovereign model archive on Hetzner Storage Box
+             u642948, built via ai_research/ops/model_archive (Terraform +
+             models.txt, sha256-verified). Collection: GLM-5.2 (native FP8),
+             Kimi-K3 (native 4-bit MXFP4, 1.56 TB) + Kimi-K3 2-bit
+             (unsloth UD-Q2_K_XL, 861 GB), Inkling, Gemma-4-12B-agentic +
+             Gemma4-31B-Fable-5-Distilled (full + GGUF), GLM-5.2-NVFP4,
+             Inkling-NVFP4; trace datasets Fable-5 + GPT-5.6-Sol under
+             datasets/ on the box.
+             Compute: ON-DEMAND big-machine reservations, never always-on.
+             Sizing established 2026-07-31: full Kimi-K3 (2.8T, all 896 experts
+             must be resident, ~1.6 TB) needs ONE Scaleway B300-SXM-8-288G
+             (8x B300, 2304 GB VRAM, ~EUR 60-70/hr — confirm exact price) OR a
+             multi-node H100 cluster; the 2-bit Kimi (861 GB) fits a single
+             8x H100 (640 GB, ~EUR 23/hr). Use per-minute billing +
+             power-off-when-idle, same lifecycle as GEN-001. Copy weights
+             Hetzner -> Scaleway block volume once, boot instance against it.
+             Realistic targets: LoRA/QLoRA + RL (GRPO/DPO) on the mid-size
+             models (Gemma) and adapters on the big MoE ones; full-FT of a
+             frontier MoE is out of scope. Extends GEN-005 (Modal LoRA) to the
+             archived collection and to reserved GPU (Modal caps out below this
+             scale). Sovereignty: keep on EU/Scaleway; note AI-Act GPAI
+             exposure. Do NOT provision until a concrete experiment is scoped.
+
+- [ ] [GEN-008] [OPEN 2026-10-15] Serving platform v1: GEX131 essentials, Scaleway single GPU, gateway hosting + routing (own / Bedrock / BYOK), local-vs-cloud switch
+      priority: high | project: serving-platform | division: GEN
+      notes: Plan = oasis-x/.swarm/GENERATIVE_PLAN.md §11 (work items in §11.7).
+             Builder: Kolmogorov (clone bot-work/kolmogorov/oasis-generation; his
+             design docs/OX-MODELS-INTERFACE-TRAINING-DESIGN.md, 9d3980f). Infra: Yes Man.
+             Mike: order the GEX131 (Robot panel) + Robot webservice credential for
+             Yes Man; validate identity on the hello@ Scaleway org (unlocks quota 1 for
+             L40S-1-48G, then GEN-001 under INFRA-0002); pick the gateway host (§11.4,
+             recommendation: ECS Fargate eu-central-1 for customers, Mac kept for the fleet).
+             Code first, no infra: route table + hot reload + X-Oasis-Route, BYOK registry
+             + conformance run + SSRF guard, /v1/x/decide + /v1/gate.
+             Pin vllm/vllm-openai by digest before any box runs it (Dockerfile.runner uses :latest).
+
+- [/] [GEN-007] [PHASE 0 LIVE 2026-10-07 · audit pass 1 DONE] Decision models: audit queue, fine-tune, placement
+      priority: medium | project: decision-models | division: GEN
+      notes: Plan = oasis-x/.swarm/GENERATIVE_PLAN.md §10. Sidecar + reviewer
+             shadow = oasis-claw CLAW-118 (live on all 7 bots).
+             Audit: ai_research/ops/model_archive/decision_models.txt (queue) +
+             vet_static.py. Pass 1 (43 repos incl. the whole archive): 20 PASS,
+             19 REVIEW, 4 GONE, 0 FAIL -> docs/archive-vetting-static.md,
+             docs/decision-models-vetting.md. GONE: autotrust gemma4-31B distill
+             (+GGUF) and 2 Fable-5 trace sets; our archive copies are the only ones.
+             Added to models.txt (not yet transferred, 6.2 GB): laya-typed-decisions,
+             laya-multilingual, strands-decider-2B v21 (LoRA) + Qwen3.5-2B-Base.
+             Next: (1) read laya base .py + Mapika engine, pplx inference.py;
+             (2) archive transfer after the reaper (ADM-057) is deployed;
+             (3) phase 1 fine-tune of Laya on judge labels, gate in §10.6;
+             (4) GPU placement on the pooled GEX131 (§10.7).
+             Owner after Mike grants gh tokens: Kolmogorov. Infra applies: Yes Man.
+
 ---
 
 ## Done

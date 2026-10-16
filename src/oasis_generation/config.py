@@ -4,6 +4,7 @@ Everything comes from the environment so the same image runs locally
 (against Docker Model Runner) and in the EU cloud (against a vLLM runner).
 """
 
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings
@@ -17,6 +18,11 @@ class Settings(BaseSettings):
     # Comma-separated bearer tokens. Empty string = auth disabled (local dev
     # only — never deploy without tokens).
     service_tokens: str = ""
+
+    # Fail closed (GEN-008): any internet-facing deployment sets this. With it
+    # set and no service tokens, the gateway refuses to start and answers 503
+    # to every authenticated route, instead of serving everyone.
+    require_auth: bool = False
 
     # Request timeout toward the upstream engine, in seconds. Generation on
     # a cold or busy runner can be slow; keep this generous.
@@ -39,7 +45,33 @@ class Settings(BaseSettings):
     decider_url: str = "http://oasis-decider:8790/v1/decide"
     x_timeout_s: float = 10.0
 
+    # ── Per-client route switch (GEN-008, remote.py) ──
+    # The other gateway a client can be switched to (the Hetzner VM). Must be
+    # https; empty = no remote, every client stays local. Includes /v1.
+    remote_base_url: str = ""
+    # Secrets come from FILES (mounted read-only), never env vars, so neither
+    # `docker compose config` nor `docker inspect` can print them.
+    remote_token_file: str = "/secrets/generation/remote-token"
+    admin_token_file: str = "/secrets/generation/admin-token"
+    # Route state + audit log. Host-side, so a recreate keeps the switches.
+    route_state_file: str = "/state/routing.json"
+    # Clients allowed to switch THEMSELVES with their own token (Telegram
+    # /genroute). Comma list of client names, "*" = every token client, "" = none.
+    self_switch_clients: str = ""
+
     model_config = {"env_prefix": "OASIS_GENERATION_"}
+
+    @property
+    def remote_configured(self) -> bool:
+        return self.remote_base_url.startswith("https://") and bool(
+            self.remote_token_file and os.path.exists(self.remote_token_file)
+        )
+
+    def may_self_switch(self, client: str) -> bool:
+        allowed = {c.strip() for c in self.self_switch_clients.split(",") if c.strip()}
+        if "*" in allowed:
+            return client in set(self.token_clients.values())
+        return client in allowed
 
     @property
     def tokens(self) -> set[str]:

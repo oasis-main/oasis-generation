@@ -53,5 +53,15 @@ resource "scaleway_instance_server" "runner" {
     })
   }
 
-  tags = concat(["oasis-generation", "tier:${var.tier}"], var.extra_tags)
+  # lease-until=<unix seconds> is read by the infra-reaper (oasis-cloud-admin/
+  # infra_reaper, ADM-057), which runs every 15 min in GCP and POWERS OFF any
+  # running instance whose lease has expired, or that has no lease 3h after its
+  # last state change. Power-off stops compute billing and keeps the weights
+  # volume. Set var.lease_until for a planned session; the reaper caps any
+  # lease at 72h ahead. The future wake controller (GEN-004) extends it.
+  tags = concat(
+    ["oasis-generation", "tier:${var.tier}"],
+    var.lease_until == "" ? [] : ["lease-until=${var.lease_until}"],
+    var.extra_tags,
+  )
 }

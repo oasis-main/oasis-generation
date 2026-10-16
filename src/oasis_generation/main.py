@@ -31,8 +31,20 @@ from .remote import TARGETS, RouteStore, read_secret_file, token_matches
 app = FastAPI(title="oasis-generation", version="0.0.1")
 
 
+@app.on_event("startup")
+def _refuse_open_deployment() -> None:
+    """An internet-facing gateway with no tokens would serve anyone (GEN-008)."""
+    s = get_settings()
+    if s.require_auth and not s.tokens:
+        raise RuntimeError(
+            "OASIS_GENERATION_REQUIRE_AUTH is set but OASIS_GENERATION_SERVICE_TOKENS is empty; refusing to start"
+        )
+
+
 def check_auth(request: Request, settings: Settings = Depends(get_settings)) -> None:
     if not settings.tokens:
+        if settings.require_auth:
+            raise HTTPException(status_code=503, detail="gateway has no service tokens configured")
         request.state.client = "auth-disabled"
         return
     auth = request.headers.get("authorization", "")

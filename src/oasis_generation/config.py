@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     # only — never deploy without tokens).
     service_tokens: str = ""
 
+    # Fail closed (GEN-008): any internet-facing deployment sets this. With it
+    # set and no service tokens, the gateway refuses to start and answers 503
+    # to every authenticated route, instead of serving everyone.
+    require_auth: bool = False
+
     # Request timeout toward the upstream engine, in seconds. Generation on
     # a cold or busy runner can be slow; keep this generous.
     upstream_timeout_s: float = 300.0

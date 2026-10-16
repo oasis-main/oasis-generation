@@ -174,3 +174,18 @@ def test_corrupt_state_file_means_local(env):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json")
     assert client.get("/v1/models", headers=BOT).headers["X-Oasis-Served-By"] == "local"
+
+
+def test_require_auth_without_tokens_refuses(monkeypatch):
+    """GEN-008: an internet-facing gateway with no tokens must not serve anyone."""
+    monkeypatch.setenv("OASIS_GENERATION_SERVICE_TOKENS", "")
+    monkeypatch.setenv("OASIS_GENERATION_REQUIRE_AUTH", "1")
+    get_settings.cache_clear()
+    assert client.get("/v1/models").status_code == 503
+    with pytest.raises(RuntimeError, match="refusing to start"):
+        main._refuse_open_deployment()
+    # Negative control: without REQUIRE_AUTH the local-dev behaviour is unchanged.
+    monkeypatch.delenv("OASIS_GENERATION_REQUIRE_AUTH")
+    get_settings.cache_clear()
+    assert client.get("/v1/models").status_code == 200
+    main._refuse_open_deployment()

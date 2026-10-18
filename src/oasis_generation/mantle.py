@@ -229,11 +229,43 @@ def openai_to_responses(
     return payload
 
 
+def _stop_reason(resp: dict) -> str:
+    """The Responses outcome as one raw string, for the log and the ledger.
+
+    "refusal" when the model returned a refusal content part; otherwise the
+    status, with the incomplete reason appended (e.g.
+    "incomplete:content_filter"). Same role as Converse's stopReason.
+    """
+    for item in resp.get("output") or []:
+        if item.get("type") == "message":
+            if any(part.get("type") == "refusal" for part in item.get("content") or []):
+                return "refusal"
+    status = resp.get("status") or "unknown"
+    if status == "incomplete":
+        reason = (resp.get("incomplete_details") or {}).get("reason") or "unknown"
+        return f"incomplete:{reason}"
+    return status
+
+
+# Raw stop reason -> OpenAI finish_reason. Before 2026-10-18 a content-filter
+# stop and a refusal both came back as "stop" with empty text, which a client
+# cannot tell from a model that chose to say nothing (the same gap that hid
+# the 2026-10-17 empty-judge denies on the Converse path).
+_FINISH_REASON = {
+    "completed": "stop",
+    "incomplete:max_output_tokens": "length",
+    "incomplete:content_filter": "content_filter",
+    "refusal": "content_filter",
+}
+
+
 def _finish_reason(resp: dict) -> str:
-    if resp.get("status") == "incomplete":
-        reason = (resp.get("incomplete_details") or {}).get("reason")
-        return "length" if reason == "max_output_tokens" else "stop"
-    return "stop"
+    stop = _stop_reason(resp)
+    finish = _FINISH_REASON.get(stop)
+    if finish is None:
+        logger.warning("mantle unknown stop reason %r mapped to finish_reason=stop", stop)
+        return "stop"
+    return finish
 
 
 def responses_to_openai(resp: dict, public_id: str, completion_id: str, created: int) -> dict:
@@ -275,6 +307,7 @@ def responses_to_openai(resp: dict, public_id: str, completion_id: str, created:
                 "index": 0,
                 "message": message,
                 "finish_reason": "tool_calls" if tool_calls else _finish_reason(resp),
+                "upstream_stop_reason": _stop_reason(resp),
             }
         ],
         # Responses' input_tokens already include cached tokens (OpenAI
@@ -303,7 +336,18 @@ async def complete(
     if resp.status_code >= 400:
         logger.error("mantle complete() %s for %s: %s", resp.status_code, public_id, resp.text[:300])
         raise RuntimeError(f"bedrock-mantle {resp.status_code}: {resp.text[:300]}")
-    return responses_to_openai(resp.json(), public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time()))
+    out = responses_to_openai(resp.json(), public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time()))
+    choice = out["choices"][0]
+    stop = choice.get("upstream_stop_reason")
+    output_tokens = out["usage"].get("completion_tokens")
+    # Same rule as bedrock._log_outcome: WARNING for an abnormal or empty turn.
+    level = logging.INFO if stop == "completed" and output_tokens else logging.WARNING
+    logger.log(
+        level,
+        "mantle done model_id=%s public_id=%s stop_reason=%s output_tokens=%s",
+        model_id, public_id, stop, output_tokens,
+    )
+    return out
 
 
 def _sse(obj: dict) -> bytes:
@@ -313,15 +357,25 @@ def _sse(obj: dict) -> bytes:
 async def stream(
     model_id: str, body: dict, region: str, public_id: str,
     defaults: "InferenceDefaults | None" = None,
+    outcome: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """v0 streaming: the Responses call is non-streaming, then the completed
     answer (text and/or tool_calls) is emitted as OpenAI SSE chunks. True token
-    streaming (Responses SSE events -> OpenAI deltas) is a follow-up."""
+    streaming (Responses SSE events -> OpenAI deltas) is a follow-up.
+
+    `outcome`: same contract as bedrock.stream (stop_reason, finish_reason,
+    usage), for the usage ledger."""
     result = await complete(model_id, {**body, "stream": False}, region, public_id, defaults)
     cid = result["id"]
     created = result["created"]
     choice = result["choices"][0]
     message = choice["message"]
+    if outcome is not None:
+        outcome.update(
+            stop_reason=choice.get("upstream_stop_reason"),
+            finish_reason=choice["finish_reason"],
+            usage=result.get("usage"),
+        )
 
     def chunk(delta: dict, finish: str | None = None) -> dict:
         return {
@@ -343,6 +397,8 @@ async def stream(
             "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]},
         }]}))
     final = chunk({}, choice["finish_reason"])
+    if choice.get("upstream_stop_reason"):
+        final["choices"][0]["upstream_stop_reason"] = choice["upstream_stop_reason"]
     # Same contract as bedrock.stream: usage rides the last chunk when the
     # caller asked for it (openclaw does, via compat.supportsUsageInStreaming).
     if (body.get("stream_options") or {}).get("include_usage") and result.get("usage"):

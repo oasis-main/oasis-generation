@@ -89,15 +89,66 @@ def _resolve_inference(
     max_tokens = int(requested_max or profile_max or _DEFAULT_MAX_TOKENS)
     return thinking, effort, max_tokens, allow_temp, allow_samp
 
-# Converse stopReason -> OpenAI finish_reason.
+# Converse stopReason -> OpenAI finish_reason. Every value in botocore's
+# StopReason enum (1.43) is listed, plus "refusal" (the Anthropic API's own
+# stop reason for a safety refusal, not in the enum but possible on newer
+# Claude models). An unknown value still maps to "stop" so an OpenAI client
+# is never handed a finish_reason it cannot parse, but it is logged (see
+# _finish_reason) and the raw value rides on the response as
+# "upstream_stop_reason".
+#
+# WHY (2026-10-17): Nimbus's reviewer judge got 4 empty replies in a row and
+# denied 4 reach_send calls. Bedrock had returned stopReason
+# "content_filtered" with 0 output tokens; the gateway mapped it correctly but
+# recorded it nowhere, so the cause took a full replay to find.
 _FINISH_REASON = {
     "end_turn": "stop",
     "stop_sequence": "stop",
     "max_tokens": "length",
+    "model_context_window_exceeded": "length",
     "tool_use": "tool_calls",
     "content_filtered": "content_filter",
     "guardrail_intervened": "content_filter",
+    "refusal": "content_filter",
+    # No OpenAI equivalent: the model produced output Bedrock could not parse.
+    # "stop" keeps clients working; the raw reason is logged and returned.
+    "malformed_model_output": "stop",
+    "malformed_tool_use": "stop",
 }
+
+# Stop reasons that end a turn normally. Anything else is logged at WARNING,
+# and so is any turn that produced no output tokens.
+_NORMAL_STOP = frozenset({"end_turn", "stop_sequence", "tool_use", "max_tokens"})
+
+
+def _finish_reason(stop_reason: str | None) -> str:
+    """Converse stopReason -> OpenAI finish_reason ("stop" when unknown)."""
+    finish = _FINISH_REASON.get(stop_reason or "")
+    if finish is None:
+        logger.warning("bedrock unknown stopReason=%r mapped to finish_reason=stop", stop_reason)
+        return "stop"
+    return finish
+
+
+def _log_outcome(
+    model_id: str, public_id: str, stop_reason: str | None, usage: dict | None, streamed: bool,
+) -> None:
+    """One log line per completed call: raw stop reason and output tokens.
+
+    WARNING when the turn did not end normally or produced nothing (the
+    2026-10-17 empty-judge case: content_filtered, outputTokens=0), else INFO.
+    """
+    output_tokens = (usage or {}).get("completion_tokens")
+    level = (
+        logging.WARNING
+        if stop_reason not in _NORMAL_STOP or not output_tokens
+        else logging.INFO
+    )
+    logger.log(
+        level,
+        "bedrock done model_id=%s public_id=%s streamed=%s stop_reason=%s output_tokens=%s",
+        model_id, public_id, streamed, stop_reason, output_tokens,
+    )
 
 
 @lru_cache(maxsize=8)
@@ -593,7 +644,9 @@ def converse_to_openai(resp: dict, public_id: str, completion_id: str, created: 
             {
                 "index": 0,
                 "message": msg,
-                "finish_reason": _FINISH_REASON.get(resp.get("stopReason", ""), "stop"),
+                "finish_reason": _finish_reason(resp.get("stopReason")),
+                # Raw Converse stopReason; finish_reason folds several into one.
+                "upstream_stop_reason": resp.get("stopReason"),
             }
         ],
         "usage": _usage(resp.get("usage")),
@@ -614,9 +667,11 @@ async def complete(
             model_id, public_id, region,
         )
         raise
-    return converse_to_openai(
+    out = converse_to_openai(
         resp, public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
     )
+    _log_outcome(model_id, public_id, resp.get("stopReason"), out["usage"], streamed=False)
+    return out
 
 
 def _sse(obj: dict) -> bytes:
@@ -626,12 +681,18 @@ def _sse(obj: dict) -> bytes:
 async def stream(
     model_id: str, body: dict, region: str, public_id: str,
     defaults: "InferenceDefaults | None" = None,
+    outcome: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """Streaming completion as OpenAI SSE chunks.
 
     boto3's converse_stream returns a synchronous EventStream; iterate it in a
     worker thread and hand chunks to the async generator via a queue so the
     FastAPI event loop is never blocked.
+
+    `outcome`, when given, is filled as the stream ends with "stop_reason"
+    (raw Converse), "finish_reason" and "usage" (always captured, whether or
+    not the client asked for a usage frame) so the caller can write them to
+    the usage ledger.
     """
     kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id), cache_key=model_id)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -673,6 +734,7 @@ async def stream(
     # Open with the assistant role so clients see a well-formed first chunk.
     yield _sse(base({"role": "assistant"}))
     finish_reason = "stop"
+    stop_reason: str | None = None
     usage: dict | None = None
     # Converse indexes content blocks (text and tool calls share one sequence);
     # OpenAI indexes tool_calls on their own. Map block index -> tool_call index.
@@ -684,6 +746,7 @@ async def stream(
             break
         if kind == "error":
             # Emit a terminal error frame, then close cleanly.
+            stop_reason = "gateway_error"
             yield _sse(base({}, "stop") | {"error": str(payload)})
             break
         event = payload
@@ -719,13 +782,17 @@ async def stream(
                 if rt:
                     yield _sse(base({"reasoning_content": rt}))
         elif "messageStop" in event:
-            finish_reason = _FINISH_REASON.get(
-                event["messageStop"].get("stopReason", ""), "stop"
-            )
-        elif "metadata" in event and include_usage:
+            stop_reason = event["messageStop"].get("stopReason")
+            finish_reason = _finish_reason(stop_reason)
+        elif "metadata" in event:
             usage = _usage(event["metadata"].get("usage"))
 
+    if outcome is not None:
+        outcome.update(stop_reason=stop_reason, finish_reason=finish_reason, usage=usage)
+    _log_outcome(model_id, public_id, stop_reason, usage, streamed=True)
     final = base({}, finish_reason)
+    if stop_reason:
+        final["choices"][0]["upstream_stop_reason"] = stop_reason
     if include_usage and usage is not None:
         final["usage"] = usage
     yield _sse(final)

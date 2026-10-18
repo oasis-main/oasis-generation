@@ -86,13 +86,18 @@ USAGE_LOG = os.environ.get("OASIS_GENERATION_USAGE_LOG", "/usage/requests.jsonl"
 def _record_usage(
     client: str, entry: CatalogEntry, usage: dict | None, streamed: bool, status: int,
     origin_client: str | None = None,
+    stop_reason: str | None = None, finish_reason: str | None = None,
 ) -> None:
-    _record_usage_raw(client, entry.public_id, entry.backend, usage, streamed, status, origin_client)
+    _record_usage_raw(
+        client, entry.public_id, entry.backend, usage, streamed, status, origin_client,
+        stop_reason, finish_reason,
+    )
 
 
 def _record_usage_raw(
     client: str, model: str, backend: str, usage: dict | None, streamed: bool, status: int,
     origin_client: str | None = None,
+    stop_reason: str | None = None, finish_reason: str | None = None,
 ) -> None:
     """Append one usage record. Never raises: a cost-ledger write must not be
     able to fail a model call the caller is waiting on."""
@@ -101,6 +106,11 @@ def _record_usage_raw(
         import json as _json
 
         u = usage or {}
+
+        def first(*keys):
+            # Not `a or b`: a real 0 (an empty, filtered turn) must stay 0.
+            return next((u[k] for k in keys if u.get(k) is not None), None)
+
         rec = {
             "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "client": client,
@@ -110,13 +120,20 @@ def _record_usage_raw(
             "streamed": streamed,
             # Absent on streamed calls whose backend omits a usage block; left
             # null rather than zero so "unknown" is distinguishable from "free".
-            "prompt_tokens": u.get("prompt_tokens") or u.get("input_tokens"),
-            "completion_tokens": u.get("completion_tokens") or u.get("output_tokens"),
+            "prompt_tokens": first("prompt_tokens", "input_tokens"),
+            "completion_tokens": first("completion_tokens", "output_tokens"),
             "cached_tokens": (
                 (u.get("prompt_tokens_details") or {}).get("cached_tokens")
                 or u.get("cache_read_input_tokens")
             ),
         }
+        # Raw upstream stop reason (Converse stopReason, or the Responses
+        # status) and the OpenAI finish_reason it became. Only the Bedrock
+        # backends report them; null elsewhere. Added 2026-10-18: a
+        # content_filtered turn with 0 output tokens is otherwise invisible.
+        if stop_reason is not None or finish_reason is not None:
+            rec["stop_reason"] = stop_reason
+            rec["finish_reason"] = finish_reason
         if origin_client:
             rec["origin_client"] = origin_client
         path = USAGE_LOG
@@ -390,22 +407,43 @@ async def self_set_routing(request: Request, settings: Settings = Depends(get_se
 def _logged_json(request: Request, entry: CatalogEntry, payload: dict) -> JSONResponse:
     """Return the payload, recording its usage block on the way out."""
     usage = payload.get("usage") if isinstance(payload, dict) else None
+    choice = ((payload.get("choices") or [{}])[0] if isinstance(payload, dict) else {}) or {}
     _record_usage(_client_of(request), entry, usage, streamed=False, status=200,
-                  origin_client=_origin_of(request))
+                  origin_client=_origin_of(request),
+                  stop_reason=choice.get("upstream_stop_reason"),
+                  finish_reason=choice.get("finish_reason"))
     return JSONResponse(payload)
 
 
-def _logged_stream(request: Request, entry: CatalogEntry, gen) -> StreamingResponse:
-    """Streamed calls are recorded at dispatch, with token counts left null.
+def _logged_stream(
+    request: Request, entry: CatalogEntry, gen, outcome: dict | None = None,
+) -> StreamingResponse:
+    """Streamed calls are recorded when the stream ENDS, not at dispatch.
 
-    The generator is consumed by the client, not here, so waiting for a usage
-    block would mean buffering the whole stream — which would defeat streaming.
-    A row with null tokens still gives call counts per bot per model, and the
-    authoritative cost stays the CUR either way.
+    The row is written as the generator finishes (or is closed by a client
+    disconnect), so it can carry what the backend put in `outcome`: usage,
+    stop_reason and finish_reason (the Bedrock backends fill it; others leave
+    the token counts null). Nothing is buffered: chunks pass straight through.
+
+    Before 2026-10-18 the row was written at dispatch with null tokens, so a
+    streamed turn that Bedrock cut off with content_filtered and 0 output
+    tokens looked identical to a normal one in the ledger.
     """
-    _record_usage(_client_of(request), entry, None, streamed=True, status=200,
-                  origin_client=_origin_of(request))
-    return StreamingResponse(gen, media_type="text/event-stream")
+    client_name = _client_of(request)
+    origin = _origin_of(request)
+
+    async def recorded():
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            o = outcome or {}
+            _record_usage(client_name, entry, o.get("usage"), streamed=True, status=200,
+                          origin_client=origin,
+                          stop_reason=o.get("stop_reason"),
+                          finish_reason=o.get("finish_reason"))
+
+    return StreamingResponse(recorded(), media_type="text/event-stream")
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
@@ -421,10 +459,11 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
     if entry.backend == "bedrock":
         try:
             if body.get("stream"):
+                outcome: dict = {}
                 return _logged_stream(request, entry, bedrock.stream(
                     entry.upstream_id, body, settings.bedrock_region,
-                    entry.public_id, entry.inference,
-                ))
+                    entry.public_id, entry.inference, outcome=outcome,
+                ), outcome)
             payload = await bedrock.complete(
                 entry.upstream_id, body, settings.bedrock_region,
                 entry.public_id, entry.inference,
@@ -439,10 +478,11 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
         # GPT-5.6-sol — OpenAI Responses API on the bedrock-mantle endpoint (SigV4).
         try:
             if body.get("stream"):
+                outcome = {}
                 return _logged_stream(request, entry, mantle.stream(
                     entry.upstream_id, body, settings.bedrock_region,
-                    entry.public_id, entry.inference,
-                ))
+                    entry.public_id, entry.inference, outcome=outcome,
+                ), outcome)
             payload = await mantle.complete(
                 entry.upstream_id, body, settings.bedrock_region,
                 entry.public_id, entry.inference,

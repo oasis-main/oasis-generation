@@ -68,21 +68,23 @@ variable "image" {
   default = "ubuntu-24.04"
 }
 
-# Addresses allowed to reach port 22, as CIDRs (e.g. ["203.0.113.7/32"]).
-# Empty (default) means NO ssh rule at all: only 443 is open.
+# Addresses allowed to reach port 22, as IPv4 CIDRs (the Mac's address, /32;
+# Yes Man passes it with -var at plan time, e.g. ["203.0.113.7/32"]).
+# Empty (default) means NO ssh rule at all: only 443 is open. IPv4 only.
 variable "ssh_source_cidrs" {
   type    = list(string)
   default = []
   validation {
-    condition     = alltrue([for c in var.ssh_source_cidrs : c != "0.0.0.0/0" && c != "::/0"])
-    error_message = "Port 22 must never be open to the world."
+    condition     = alltrue([for c in var.ssh_source_cidrs : can(cidrhost(c, 0)) && !strcontains(c, ":") && c != "0.0.0.0/0"])
+    error_message = "Port 22: IPv4 CIDRs only, never 0.0.0.0/0."
   }
 }
 
-# Public key (NOT a secret) to install for ssh. Empty = none registered.
+# Public key (NOT a secret) for the Mac-side secrets push (GEN-008, scripts/
+# claw-gen-vm-bootstrap). The private half stays on the Mac host only.
 variable "ssh_public_key" {
   type    = string
-  default = ""
+  default = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMG289PIccZQ+0MH1Cx3Yhp0UuyTC6fvm7bLzIRlpjVD oasis-gen-vm"
 }
 
 # Hostname Caddy serves and gets a certificate for (TLS-ALPN-01, port 443 only).

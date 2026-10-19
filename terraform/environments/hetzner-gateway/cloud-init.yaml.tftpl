@@ -52,7 +52,9 @@ write_files:
         caddy_data: {}
 runcmd:
   - systemctl enable --now docker
-  - mkdir -p /opt/gateway/usage
+  # The gateway image runs as uid 10001 (non-root); the usage ledger is silently
+  # empty unless this folder is writable by that uid.
+  - install -d -o 10001 -g 10001 /opt/gateway/usage
   # Expected to fail on first boot (secrets.env absent); the post-boot secret
   # push runs `docker compose up -d` again. Do not fail cloud-init on it.
   - cd /opt/gateway && (docker compose up -d || echo "waiting for /opt/gateway/secrets.env")

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidSignature
@@ -37,8 +38,35 @@ def b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
+_B64U_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+
+
 def b64u_dec(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    """Strict base64url, no padding. One byte string has exactly one text form.
+
+    Refuses padding, the std alphabet (+ /), whitespace, and non-canonical
+    trailing bits (the decoded bytes must re-encode to the same text). Raises
+    ValueError on any of these; callers map that to `malformed`.
+    """
+    if not _B64U_RE.match(s):
+        raise ValueError("not base64url")
+    raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+    if b64u(raw) != s:
+        raise ValueError("non-canonical base64url")
+    return raw
+
+
+def _no_dup_pairs(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate JSON key")
+        d[k] = v
+    return d
+
+
+def _loads_strict(b: bytes):
+    return json.loads(b, object_pairs_hook=_no_dup_pairs)
 
 
 def _pub_raw(seed: bytes) -> bytes:
@@ -63,6 +91,13 @@ def _json(o) -> bytes:
     return json.dumps(o, separators=(",", ":"), sort_keys=True).encode()
 
 
+def sign_raw(header_bytes: bytes, payload_bytes: bytes, seed: bytes) -> str:
+    """Sign exact bytes (for vectors that need non-canonical JSON)."""
+    h, p = b64u(header_bytes), b64u(payload_bytes)
+    sig = Ed25519PrivateKey.from_private_bytes(seed).sign(f"{h}.{p}".encode())
+    return f"{h}.{p}.{b64u(sig)}"
+
+
 def sign(header: dict, payload: dict, seed: bytes) -> str:
     h, p = b64u(_json(header)), b64u(_json(payload))
     sig = Ed25519PrivateKey.from_private_bytes(seed).sign(f"{h}.{p}".encode())
@@ -76,8 +111,13 @@ class Result:
 
 
 def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
-           revoked_jti: frozenset[str] = frozenset()) -> Result:
-    """Return Result(ok, reason). Never raises on bad input."""
+           revoked_jti: frozenset[str] = frozenset(),
+           not_before_by_sub: dict[str, int] | None = None) -> Result:
+    """Return Result(ok, reason). Never raises on bad input.
+
+    not_before_by_sub: per-user revocation (CONTRACT section 6). A token whose
+    `iat` is earlier than the value for its `sub` is refused as `revoked`.
+    """
     def no(r: str) -> Result:
         return Result(False, r)
 
@@ -85,8 +125,8 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
     if len(parts) != 3:
         return no("malformed")
     try:
-        header = json.loads(b64u_dec(parts[0]))
-        payload = json.loads(b64u_dec(parts[1]))
+        header = _loads_strict(b64u_dec(parts[0]))
+        payload = _loads_strict(b64u_dec(parts[1]))
         sig = b64u_dec(parts[2])
     except Exception:
         return no("malformed")
@@ -120,7 +160,9 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
     if not all(type(v) is int for v in ints):
         return no("malformed")
     iat, exp = ints
-    if exp - iat > MAX_LIFETIME_S or exp <= iat:
+    if exp <= iat:
+        return no("bad_lifetime")
+    if exp - iat > MAX_LIFETIME_S:
         return no("lifetime_too_long")
     if now >= exp + LEEWAY_S:
         return no("expired")
@@ -137,7 +179,13 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
         return no("malformed")
     if not isinstance(payload["jti"], str) or not payload["jti"]:
         return no("malformed")
+    ws = payload.get("ws")
+    if "ws" in payload and not (isinstance(ws, list) and all(isinstance(w, str) for w in ws)):
+        return no("malformed")
     if payload["jti"] in revoked_jti:
+        return no("revoked")
+    nb = (not_before_by_sub or {}).get(payload["sub"])
+    if nb is not None and iat < nb:
         return no("revoked")
     if required_scope is not None and required_scope not in sc:
         return no("missing_scope")
@@ -154,7 +202,8 @@ def check_inference_allowed(payload: dict) -> int:
         return 403
     if payload["tier"] == "free" or payload["billing_state"] != "active":
         return 402
-    if "allowance_ref" not in payload:
+    ref = payload.get("allowance_ref")
+    if not isinstance(ref, str) or not ref:
         return 402
     return 200
 
@@ -186,9 +235,10 @@ def build_vectors() -> dict:
     jwks = jwks_for({KID_A: TEST_SEED_A})
     V: list[dict] = []
 
-    def add(name, token, expect, now=NOW, scope=None, revoked=(), note=""):
+    def add(name, token, expect, now=NOW, scope=None, revoked=(), note="", not_before=None):
         V.append({"name": name, "token": token, "now": now,
                   "required_scope": scope, "revoked_jti": list(revoked),
+                  "not_before_by_sub": dict(not_before or {}),
                   "expect": expect, "note": note})
 
     ok = sign(base_header(), base_payload(), TEST_SEED_A)
@@ -233,11 +283,41 @@ def build_vectors() -> dict:
     add("alg_HS256", sign(base_header(alg="HS256"), base_payload(), TEST_SEED_A), "bad_alg")
     add("alg_ES256", sign(base_header(alg="ES256"), base_payload(), TEST_SEED_A), "bad_alg")
     add("bad_typ", sign(base_header(typ="JWT"), base_payload(), TEST_SEED_A), "bad_typ")
+    add("exp_equals_iat",
+        sign(base_header(), base_payload(exp=NOW), TEST_SEED_A), "bad_lifetime")
+    add("exp_before_iat",
+        sign(base_header(), base_payload(exp=NOW - 1), TEST_SEED_A), "bad_lifetime")
+    # strict encoding: one token, one string form
+    sg = ok.split(".")
+    add("sig_with_padding", f"{sg[0]}.{sg[1]}.{sg[2]}==", "malformed",
+        note="padding is refused; a validly signed token must not have a second string form")
+    alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    last = sg[2][-1]
+    alt = alpha[(alpha.index(last) & ~0xF) | ((alpha.index(last) + 1) & 0xF)]
+    add("sig_noncanonical_last_char", f"{sg[0]}.{sg[1]}.{sg[2][:-1]}{alt}", "malformed",
+        note="only the 4 unused low bits of the last char differ; decoded bytes are identical")
+    add("payload_std_alphabet_char", f"{sg[0]}.{sg[1].replace('_', '/').replace('-', '+') + '+'}.{sg[2]}",
+        "malformed", note="'+' is not in the base64url alphabet")
+    # duplicate JSON keys: a first-wins verifier and a last-wins verifier would disagree
+    hdr_dup = ('{"alg":"EdDSA","kid":"nope","kid":"%s","typ":"%s"}' % (KID_A, TYP)).encode()
+    add("duplicate_key_in_header", sign_raw(hdr_dup, _json(base_payload()), TEST_SEED_A), "malformed")
+    pl = _json(base_payload(tier="max")).decode()
+    pl_dup = pl[:-1] + ',"tier":"free"}'
+    add("duplicate_key_in_payload", sign_raw(_json(base_header()), pl_dup.encode(), TEST_SEED_A),
+        "malformed")
+    # ws type
+    add("ws_not_a_list", sign(base_header(), base_payload(ws="ws_a"), TEST_SEED_A), "malformed")
+    add("ws_list_with_non_string",
+        sign(base_header(), base_payload(ws=["ws_a", 7]), TEST_SEED_A), "malformed")
+    # per-user revocation (CONTRACT section 6)
+    add("revoked_by_sub_not_before", ok, "revoked", not_before={"user_test_001": NOW + 1})
+    add("sub_not_before_equal_iat_ok", ok, "ok", not_before={"user_test_001": NOW})
+    add("sub_not_before_other_user_ok", ok, "ok", not_before={"someone_else": NOW + 1000})
     # tampering after signing (payload swapped, signature kept)
     hp = ok.split(".")
     evil = b64u(_json(base_payload(tier="max", scopes=["gen:chat", "ws:shell"])))
     add("payload_swapped_keep_sig", f"{hp[0]}.{evil}.{hp[2]}", "bad_signature")
-    add("signature_truncated", ".".join(hp[:2] + [hp[2][:-4]]), "bad_signature")
+    add("signature_truncated", ".".join(hp[:2] + [hp[2][:-2]]), "bad_signature")
     add("two_segments", ".".join(hp[:2]), "malformed")
     add("garbage", "not-a-token", "malformed")
     add("empty", "", "malformed")
@@ -257,6 +337,9 @@ def build_vectors() -> dict:
     p = base_payload()
     del p["allowance_ref"]
     B.append({"name": "paid_without_allowance_ref", "payload": p, "expect_status": 402})
+    for nm, val in (("empty_string", ""), ("null", None), ("zero", 0), ("list", ["a"])):
+        B.append({"name": f"paid_allowance_ref_{nm}", "payload": base_payload(allowance_ref=val),
+                  "expect_status": 402})
 
     return {
         "contract": "oasis-capability-token/1",

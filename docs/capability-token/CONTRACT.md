@@ -15,6 +15,13 @@ lifetime <= 15 min, local verification with a cached JWKS, revocation on
 
 Compact JWS, three base64url segments, no padding.
 
+Decoding is strict, so one token has exactly one string form (a token string may be a
+cache or log key). Each segment must match `^[A-Za-z0-9_-]+$` (no `=`, no `+`, no `/`,
+no whitespace), and its decoded bytes must re-encode to the same text (this refuses
+non-canonical trailing bits). Header and payload JSON must not repeat a key: a verifier
+that keeps the first value and one that keeps the last would otherwise disagree on
+`kid`, `tier` or `scopes`. Any of these is `malformed`.
+
 Header: `{"alg":"EdDSA","typ":"oasis-cap+jwt","kid":"<key id>"}`.
 The verifier accepts exactly `alg=EdDSA` and `typ=oasis-cap+jwt`. It never reads the
 key type from the token. `none`, `HS*`, `ES*`, `RS*` are rejected (`bad_alg`).
@@ -29,10 +36,10 @@ key type from the token. `none`, `HS*`, `ES*`, `RS*` are rejected (`bad_alg`).
 | `tier` | `free` `personal` `pro` `max` | ORG-172 section 10 |
 | `billing_state` | `none` `active` `suspended` | `active` means a card is on file and billing is on |
 | `scopes` | string[] | known: `gen:chat gen:models gen:decide ws:session ws:fs ws:shell`. Unknown scopes are carried, never granted. |
-| `allowance_ref` | string | reference to the remaining spend allowance (not the amount). Required for a metered call. |
+| `allowance_ref` | non-empty string | reference to the remaining spend allowance (not the amount). Required for a metered call; empty, null or any other type gives 402. |
 | `jti` | string, non-empty | unique per token; the revocation key |
-| `iat`, `exp` | integers (seconds) | `0 < exp - iat <= 900`. Floats are `malformed`. |
-| `ws` | string[] (optional) | workspace ids; used when ORG-170 starts |
+| `iat`, `exp` | integers (seconds) | `0 < exp - iat <= 900`. Floats are `malformed`. `exp <= iat` is `bad_lifetime`; `exp - iat > 900` is `lifetime_too_long`. |
+| `ws` | string[] (optional) | workspace ids; used when ORG-170 starts. If present it must be a list of strings, else `malformed`. |
 
 Clock leeway: 30 s (expired only when `now >= exp + 30`; not yet valid when `iat > now + 30`).
 
@@ -47,7 +54,7 @@ it a full token lifetime later, remove the old key a full lifetime after that.
 ## 4. Reject codes (stable, tested)
 
 `malformed bad_alg bad_typ unknown_kid bad_signature missing_claim bad_iss bad_aud
-lifetime_too_long expired not_yet_valid bad_tier bad_billing_state revoked missing_scope`.
+lifetime_too_long bad_lifetime expired not_yet_valid bad_tier bad_billing_state revoked missing_scope`.
 Order of checks is fixed: structure, alg, typ, key, signature, then claims, then
 revocation, then scope. Nothing about a claim is trusted before the signature checks out.
 
@@ -56,7 +63,7 @@ revocation, then scope. Nothing about a claim is trusted before the signature ch
 | Token | Metered route (chat, decide) |
 |---|---|
 | `billing_state=suspended` | 403 `account_suspended` |
-| `tier=free`, or `billing_state != active`, or no `allowance_ref` | 402 `payment_required` |
+| `tier=free`, or `billing_state != active`, or `allowance_ref` missing, empty or not a string | 402 `payment_required` |
 | otherwise | allowed |
 
 `GET /v1/models` needs only a valid token with `gen:models`; free tier may list models.
@@ -68,6 +75,10 @@ oasis-auth publishes `{jti|sub, reason, ts}` on `oasis/system/auth/revocation`. 
 gateway keeps a revoked-jti set and a per-`sub` "not before" time, both held until
 `exp + leeway` of the longest-lived token. If the gateway cannot reach the broker it
 keeps serving on the last set, and the short lifetime bounds the exposure to 15 min.
+
+Reference rule for the per-`sub` time: `verify(..., not_before_by_sub={sub: t})` refuses a
+token as `revoked` when `iat < t` for its `sub` (`iat == t` is accepted). The check runs
+right after the `jti` check. Steps 2 and the gateway must implement exactly this.
 
 ## 7. Not in this contract
 

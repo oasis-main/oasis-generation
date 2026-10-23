@@ -21,7 +21,9 @@ and use the gateway as a proxy into our network. The rules, all enforced here:
      address so the caller connects to THAT ip (SNI and Host stay the original
      hostname). Use `pin()` for the real call; `check_url()` alone is for
      registration-time validation, never as the only guard on a call.
-  6. Redirects must not be followed (a 302 to http://169.254.169.254/ would
+  6. Port: 443 only unless the OPERATOR allow-lists more (never the tenant);
+     port 0 is refused (it must not default to 443).
+  7. Redirects must not be followed (a 302 to http://169.254.169.254/ would
      bypass every check above). The caller must pass follow_redirects=False.
 
 This module is stdlib only on purpose: it must stay auditable in one read.
@@ -46,6 +48,7 @@ _BLOCKED_NETS = [
         "100.64.0.0/10",      # carrier-grade NAT / Tailscale / tunnels
         "192.0.0.0/24",       # IETF protocol assignments
         "192.0.2.0/24",       # TEST-NET-1
+        "192.88.99.0/24",     # 6to4 relay anycast (deprecated; Python calls it global)
         "198.18.0.0/15",      # benchmarking
         "198.51.100.0/24",    # TEST-NET-2
         "203.0.113.0/24",     # TEST-NET-3
@@ -113,10 +116,12 @@ def _parse(url: str):
     if not host:
         raise SSRFError("url has no host")
     try:
-        port = parts.port or 443
+        explicit = parts.port
     except ValueError as exc:
         raise SSRFError(f"bad port: {exc}") from exc
-    return parts, host, port
+    if explicit is not None and not (1 <= explicit <= 65535):
+        raise SSRFError(f"bad port: {explicit}")   # port 0 must not fall through to 443
+    return parts, host, (443 if explicit is None else explicit)
 
 
 def _resolve(host: str, port: int) -> list[str]:
@@ -162,9 +167,16 @@ class Pinned:
         }
 
 
-def pin(url: str) -> Pinned:
+# Only 443 by default: a tenant-chosen port is a port scanner (22, 6379, 9200...).
+# Anything else must be allow-listed by the operator, never by the tenant.
+DEFAULT_ALLOWED_PORTS: frozenset[int] = frozenset({443})
+
+
+def pin(url: str, allowed_ports: frozenset[int] | set[int] = DEFAULT_ALLOWED_PORTS) -> Pinned:
     """Validate `url`, resolve it, check EVERY address, return a pinned target."""
     _parts, host, port = _parse(url)
+    if port not in allowed_ports:
+        raise SSRFError(f"port {port} is not allowed")
     # A literal IP in the URL is checked directly (no DNS).
     try:
         literal = ipaddress.ip_address(host)
@@ -177,6 +189,6 @@ def pin(url: str) -> Pinned:
     return Pinned(url=url, host=host, port=port, ip=addrs[0], all_ips=tuple(addrs))
 
 
-def check_url(url: str) -> None:
+def check_url(url: str, allowed_ports: frozenset[int] | set[int] = DEFAULT_ALLOWED_PORTS) -> None:
     """Registration-time validation. Raises SSRFError; returns None if fine."""
-    pin(url)
+    pin(url, allowed_ports)

@@ -31,7 +31,8 @@ def byok(settings: Settings) -> ByokRegistry:
     """One registry per byok_file ('' = an empty registry). Entries load as pending."""
     key = settings.byok_file
     if key not in _byok:
-        reg = ByokRegistry()
+        ports = {443} | {int(x) for x in settings.byok_extra_ports.split(",") if x.strip().isdigit()}
+        reg = ByokRegistry(allowed_ports=ports)
         if key:
             with open(key, encoding="utf-8") as fh:
                 raw = yaml.safe_load(fh) or {}

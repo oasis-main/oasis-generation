@@ -104,7 +104,7 @@ def test_bedrock_route_returns_openai_shape(monkeypatch):
     # The model's inference policy was applied: adaptive thinking + balanced
     # effort injected, and no temperature leaked into inferenceConfig.
     amrf = fake.seen.get("additionalModelRequestFields") or {}
-    assert amrf.get("thinking") == {"type": "adaptive"}
+    assert amrf.get("thinking") == {"type": "adaptive", "display": "summarized"}
     assert amrf.get("output_config") == {"effort": "high"}  # balanced default
     assert "temperature" not in fake.seen["inferenceConfig"]
     assert fake.seen["inferenceConfig"]["maxTokens"] == 16000  # balanced profile

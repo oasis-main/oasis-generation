@@ -175,3 +175,98 @@ def test_bedrock_role_needs_role_arn_and_runner():
     r2 = ByokRegistry(bedrock_runner=ok)
     r2.register("b", {"kind": "bedrock_role", "role_arn": "arn:aws:iam::1:role/x"})
     assert run(r2.run_conformance("b"))["status"] == "active"
+
+
+# ---- review S1 / S2 / S3 / S5 -------------------------------------------------
+from oasis_generation import byok as byok_mod
+
+
+def test_owner_gate(monkeypatch):
+    r = ByokRegistry()
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+    r.register("acme", {"kind": "openai_compat", "base_url": "https://api.acme.example/v1",
+                        "key_ref": "K", "model": "m", "tenant": "acme-corp"})
+    r.check_owner("acme", "acme-corp")
+    with pytest.raises(ByokError) as e:
+        r.check_owner("acme", "someone-else")
+    assert "acme-corp" not in str(e.value)          # does not reveal the owner
+    r.register("shared", {"kind": "openai_compat", "base_url": "https://api.acme.example/v1",
+                          "key_ref": "K", "model": "m"})
+    r.check_owner("shared", "anyone")               # untenanted = operator-shared
+
+
+def test_slow_drip_hits_total_deadline(monkeypatch):
+    """A body that trickles forever must be cut off by the TOTAL deadline."""
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+    monkeypatch.setattr(byok_mod, "CALL_DEADLINE_S", 0.3)
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x"
+
+    r = ByokRegistry(key_resolver=lambda ref: KEY,
+                     transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=Drip())))
+    r.register("acme", {"kind": "openai_compat", "base_url": "https://api.acme.example/v1",
+                        "key_ref": "K", "model": "m"})
+    with pytest.raises(ByokError, match="deadline"):
+        run(r._post(r.get("acme").entry, {}))
+
+
+def test_oversize_body_refused(monkeypatch):
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+    monkeypatch.setattr(byok_mod, "MAX_BODY_BYTES", 1000)
+    r = ByokRegistry(key_resolver=lambda ref: KEY,
+                     transport=httpx.MockTransport(lambda req: httpx.Response(200, content=b"a" * 5000)))
+    r.register("acme", {"kind": "openai_compat", "base_url": "https://api.acme.example/v1",
+                        "key_ref": "K", "model": "m"})
+    with pytest.raises(ByokError, match="exceeds"):
+        run(r._post(r.get("acme").entry, {}))
+
+
+def test_stream_deadline_and_cap(monkeypatch):
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+
+    class Drip(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x" * 100
+
+    def mk():
+        r = ByokRegistry(key_resolver=lambda ref: KEY,
+                         transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=Drip())))
+        r.register("acme", {"kind": "openai_compat", "base_url": "https://api.acme.example/v1",
+                            "key_ref": "K", "model": "m"})
+        r.get("acme").status = "active"
+        return r
+
+    async def drain(r):
+        return [c async for c in r.forward_stream("acme", {})]
+
+    monkeypatch.setattr(byok_mod, "STREAM_DEADLINE_S", 0.3)
+    with pytest.raises(ByokError, match="deadline"):
+        run(drain(mk()))
+    monkeypatch.setattr(byok_mod, "STREAM_DEADLINE_S", 30)
+    monkeypatch.setattr(byok_mod, "MAX_STREAM_BYTES", 500)
+    with pytest.raises(ByokError, match="size cap"):
+        run(drain(mk()))
+
+
+def test_refusal_message_does_not_leak_address(monkeypatch):
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+    r = reg(oai_handler())
+    _dns(monkeypatch, {"api.acme.example": ["10.1.2.3"]})     # rebinding after registration
+    with pytest.raises(ByokError) as e:
+        r.prepare(r.get("acme").entry)
+    assert "10.1.2.3" not in str(e.value) and "private" not in str(e.value)
+
+
+def test_extra_port_is_operator_only(monkeypatch):
+    _dns(monkeypatch, {"api.acme.example": ["93.184.216.34"]})
+    raw = {"kind": "openai_compat", "base_url": "https://api.acme.example:8443/v1",
+           "key_ref": "K", "model": "m"}
+    with pytest.raises(ByokError):
+        ByokRegistry().register("a", raw)
+    ByokRegistry(allowed_ports={443, 8443}).register("a", raw)

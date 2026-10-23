@@ -119,3 +119,21 @@ def test_decider_down_gate_escalates_via_http(monkeypatch, tmp_path):
 def test_example_routes_file_is_valid():
     from oasis_generation.routes import RouteTable
     RouteTable.from_dict(yaml.safe_load(open("docs/routes.example.yaml")))
+
+
+def test_conformance_needs_admin_token_not_service_token(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    admin = tmp_path / "admin-token"; admin.write_text("adm-secret")
+    monkeypatch.setenv("OASIS_GENERATION_ADMIN_TOKEN_FILE", str(admin))
+    get_settings.cache_clear()
+    try:
+        # a valid SERVICE token is not enough (review S1)
+        r = client.post("/v1/byok/acme/conformance", headers={"Authorization": "Bearer tk"})
+        assert r.status_code == 401
+        # no token at all
+        assert client.post("/v1/byok/acme/conformance").status_code == 401
+        # admin token passes auth; the provider is unknown -> 404 from the registry
+        r = client.post("/v1/byok/acme/conformance", headers={"Authorization": "Bearer adm-secret"})
+        assert r.status_code == 404
+    finally:
+        _teardown()

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -79,18 +81,74 @@ def _resolve_inference(
         effort = _EFFORT_ALIASES.get(str(requested_effort).lower(), effort)
 
     # max_tokens: explicit request wins, else the profile, else the flat default.
-    max_tokens = int(body.get("max_tokens") or profile_max or _DEFAULT_MAX_TOKENS)
+    # openclaw sends `max_completion_tokens` to a custom OpenAI-compatible
+    # endpoint (openai-completions-compat.ts maxTokensField), not `max_tokens`.
+    # Reading only `max_tokens` silently dropped every bot to the 16000
+    # balanced profile, and Opus 5.5 spent it all on thinking (2026-10-09).
+    requested_max = body.get("max_tokens") or body.get("max_completion_tokens")
+    max_tokens = int(requested_max or profile_max or _DEFAULT_MAX_TOKENS)
     return thinking, effort, max_tokens, allow_temp, allow_samp
 
-# Converse stopReason -> OpenAI finish_reason.
+# Converse stopReason -> OpenAI finish_reason. Every value in botocore's
+# StopReason enum (1.43) is listed, plus "refusal" (the Anthropic API's own
+# stop reason for a safety refusal, not in the enum but possible on newer
+# Claude models). An unknown value still maps to "stop" so an OpenAI client
+# is never handed a finish_reason it cannot parse, but it is logged (see
+# _finish_reason) and the raw value rides on the response as
+# "upstream_stop_reason".
+#
+# WHY (2026-10-17): Nimbus's reviewer judge got 4 empty replies in a row and
+# denied 4 reach_send calls. Bedrock had returned stopReason
+# "content_filtered" with 0 output tokens; the gateway mapped it correctly but
+# recorded it nowhere, so the cause took a full replay to find.
 _FINISH_REASON = {
     "end_turn": "stop",
     "stop_sequence": "stop",
     "max_tokens": "length",
+    "model_context_window_exceeded": "length",
     "tool_use": "tool_calls",
     "content_filtered": "content_filter",
     "guardrail_intervened": "content_filter",
+    "refusal": "content_filter",
+    # No OpenAI equivalent: the model produced output Bedrock could not parse.
+    # "stop" keeps clients working; the raw reason is logged and returned.
+    "malformed_model_output": "stop",
+    "malformed_tool_use": "stop",
 }
+
+# Stop reasons that end a turn normally. Anything else is logged at WARNING,
+# and so is any turn that produced no output tokens.
+_NORMAL_STOP = frozenset({"end_turn", "stop_sequence", "tool_use", "max_tokens"})
+
+
+def _finish_reason(stop_reason: str | None) -> str:
+    """Converse stopReason -> OpenAI finish_reason ("stop" when unknown)."""
+    finish = _FINISH_REASON.get(stop_reason or "")
+    if finish is None:
+        logger.warning("bedrock unknown stopReason=%r mapped to finish_reason=stop", stop_reason)
+        return "stop"
+    return finish
+
+
+def _log_outcome(
+    model_id: str, public_id: str, stop_reason: str | None, usage: dict | None, streamed: bool,
+) -> None:
+    """One log line per completed call: raw stop reason and output tokens.
+
+    WARNING when the turn did not end normally or produced nothing (the
+    2026-10-17 empty-judge case: content_filtered, outputTokens=0), else INFO.
+    """
+    output_tokens = (usage or {}).get("completion_tokens")
+    level = (
+        logging.WARNING
+        if stop_reason not in _NORMAL_STOP or not output_tokens
+        else logging.INFO
+    )
+    logger.log(
+        level,
+        "bedrock done model_id=%s public_id=%s streamed=%s stop_reason=%s output_tokens=%s",
+        model_id, public_id, streamed, stop_reason, output_tokens,
+    )
 
 
 @lru_cache(maxsize=8)
@@ -296,7 +354,153 @@ def _message_to_blocks(msg: dict) -> tuple[str, list[dict]]:
     return "user", _content_to_converse_blocks(msg.get("content"))
 
 
-def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) -> dict[str, Any]:
+# Prompt caching (2026-10-01). Converse caches ONLY up to an explicit
+# `cachePoint` block, and an OpenAI chat body carries no such marker, so before
+# this the gateway sent every fleet turn uncached: September dev Bedrock was
+# ~$1,001 of input against $0.02 of cache reads (Yes Man's Cost Explorer pull).
+# Claude on Bedrock allows up to 4 cache points; the gateway places 3, matching
+# Anthropic's prefix order tools -> system -> messages:
+#   1. end of the tool list    (stable for a bot's whole life)
+#   2. end of the system prompt (stable per session; the entrypoint sorts paths
+#      so the bytes do not move)
+#   3. end of the final user turn — the rolling point. The next agent-loop turn
+#      re-sends this exact prefix plus a few new blocks, and Anthropic's 20-block
+#      lookback finds the previous point, so each turn reads the history as a
+#      cache hit and writes only the new tail.
+# A prefix shorter than the model minimum is simply not cached (no error).
+# Non-Anthropic Bedrock models (Nova, Llama, GLM, GPT) reject or ignore the
+# block, so they never get one. OASIS_GENERATION_PROMPT_CACHE=0 turns it off.
+#
+# CACHE ONLY WHAT RECURS (same day, after the first deploy). A cache write
+# costs 1.25x input and pays off only if the same prefix is READ within the
+# ~5-minute TTL. Unconditional points made one-shot traffic dearer: the
+# oasis-reviewer judge puts a per-call random nonce in its SYSTEM prompt, so
+# every judge call wrote ~13k tokens at 1.25x and none were ever read. So:
+#   - tools / system points go on only when the same (model, prefix) hash was
+#     seen within the TTL — a never-repeating prefix stays at 1x;
+#   - the rolling message point goes on only for a continuing conversation
+#     (an assistant turn exists) whose system prefix recurred, because history
+#     after a changing system prompt can never be read back either.
+# In-process memory of hashes only (no prompt text); a restart just costs one
+# uncached call per prefix.
+_CACHE_POINT = {"cachePoint": {"type": "default"}}
+_CACHE_TTL_S = 300.0
+_PREFIX_SEEN_MAX = 4096
+_prefix_seen: dict[str, float] = {}
+_history_seen: dict[str, list] = {}
+# A child of uvicorn's INFO-level logger: the app sets no logging config, so a
+# plain module logger's INFO lines would be dropped.
+_cache_log = logging.getLogger("uvicorn.error.prompt_cache")
+
+
+def supports_prompt_cache(model_id: str) -> bool:
+    if os.environ.get("OASIS_GENERATION_PROMPT_CACHE", "1") == "0":
+        return False
+    return "anthropic.claude" in (model_id or "")
+
+
+def _recurred(key: str, now: float) -> bool:
+    """True if `key` was seen within the cache TTL; records this sighting."""
+    last = _prefix_seen.get(key)
+    _prefix_seen[key] = now
+    if len(_prefix_seen) > _PREFIX_SEEN_MAX:
+        for old in sorted(_prefix_seen, key=_prefix_seen.get)[: _PREFIX_SEEN_MAX // 4]:
+            del _prefix_seen[old]
+    return last is not None and now - last <= _CACHE_TTL_S
+
+
+def _digest(*parts: Any) -> str:
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def _add_cache_points(kwargs: dict[str, Any], cache_key: str, now: float | None = None) -> dict:
+    now = time.monotonic() if now is None else now
+    tools = (kwargs.get("toolConfig") or {}).get("tools") or []
+    system = kwargs.get("system") or []
+    messages = kwargs.get("messages") or []
+    tools_h = _digest(cache_key, tools)
+    system_h = _digest(cache_key, tools, system)
+    placed = []
+    if tools and _recurred("t:" + tools_h, now):
+        tools.append(dict(_CACHE_POINT))
+        placed.append("tools")
+    system_recurred = bool(system) and _recurred("s:" + system_h, now)
+    if system_recurred:
+        system.append(dict(_CACHE_POINT))
+        placed.append("system")
+    # Diagnostic: is the history up to the previous call (same system prefix)
+    # byte-identical? "no" means the client rewrote earlier turns (pruning,
+    # compaction), which no cache point can survive. On "no", `diverge` names
+    # the first differing message and block — its index, the message's role,
+    # the block's kind (text/toolUse/toolResult/image/...) and its old and new
+    # sizes — so the rewrite can be traced to the client feature doing it.
+    # Hashes and sizes only; no prompt text is kept or logged.
+    history, diverge = "-", ""
+    if system:
+        profile = _history_profile(messages)
+        prev = _history_seen.get(system_h)
+        if prev:
+            history, diverge = _compare_history(prev, profile)
+        _history_seen[system_h] = profile
+        if len(_history_seen) > _PREFIX_SEEN_MAX:
+            for old in list(_history_seen)[: _PREFIX_SEEN_MAX // 4]:
+                del _history_seen[old]
+    # Rolling point: only after a user turn (a trailing assistant turn is a
+    # prefill) in a conversation that already has an assistant turn.
+    continuing = any(m["role"] == "assistant" for m in messages[:-1])
+    if (system_recurred and continuing and messages
+            and messages[-1]["role"] == "user" and messages[-1]["content"]):
+        # 4th point (Claude's maximum): the end of the user turn before the
+        # latest assistant turn — exactly where the PREVIOUS call put its
+        # rolling point. Anthropic only looks back 20 blocks from a cache
+        # point, and one assistant turn with many parallel tool calls adds
+        # more than that, so without this the previous cache entry is missed.
+        last_asst = max(i for i, m in enumerate(messages[:-1]) if m["role"] == "assistant")
+        if last_asst > 0 and messages[last_asst - 1]["role"] == "user":
+            messages[last_asst - 1]["content"].append(dict(_CACHE_POINT))
+            placed.append("previous")
+        messages[-1]["content"].append(dict(_CACHE_POINT))
+        placed.append("messages")
+    return {"tools": tools_h if tools else "-", "system": system_h if system else "-",
+            "n_messages": len(messages), "placed": placed, "history": history,
+            "diverge": diverge}
+
+
+def _history_profile(messages: list[dict]) -> list[tuple[str, str, list[tuple[str, str, int]]]]:
+    """Per message: (role, digest, [(block kind, block digest, block JSON size)])."""
+    out = []
+    for m in messages:
+        blocks = []
+        for b in m.get("content") or []:
+            kind = next(iter(b), "?") if isinstance(b, dict) else type(b).__name__
+            blocks.append((kind, _digest(b), len(json.dumps(b, default=str))))
+        out.append((m.get("role", "?"), _digest(m), blocks))
+    return out
+
+
+def _compare_history(prev: list, cur: list) -> tuple[str, str]:
+    """('yes'|'no'|'-', detail) for the previous call's messages vs this call's."""
+    if len(cur) < len(prev):
+        return "no", f"shorter {len(prev)}->{len(cur)}"
+    for i, (p, c) in enumerate(zip(prev, cur)):
+        if p[1] == c[1]:
+            continue
+        role, pb, cb = c[0], p[2], c[2]
+        for j in range(max(len(pb), len(cb))):
+            if j >= len(pb) or j >= len(cb) or pb[j][1] != cb[j][1]:
+                kind = (cb[j] if j < len(cb) else pb[j])[0]
+                old = pb[j][2] if j < len(pb) else 0
+                new = cb[j][2] if j < len(cb) else 0
+                return "no", (f"msg{i}/{len(prev)} role={role} block{j}/{len(cb)} "
+                              f"kind={kind} size={old}->{new}")
+        return "no", f"msg{i}/{len(prev)} role={role} (role or block count changed)"
+    return "yes", ""
+
+
+def openai_to_converse(
+    body: dict, defaults: "InferenceDefaults | None" = None, prompt_cache: bool = False,
+    cache_key: str = "",
+) -> dict[str, Any]:
     """Build converse()/converse_stream() kwargs (minus modelId) from an OpenAI
     chat-completions body, applying the model's inference policy (`defaults`).
 
@@ -348,11 +552,25 @@ def openai_to_converse(body: dict, defaults: "InferenceDefaults | None" = None) 
     # inject nothing so the model's own default behaviour stands.
     amrf: dict[str, Any] = {}
     if thinking_mode == "adaptive":
-        amrf["thinking"] = {"type": "adaptive"}
+        # display "summarized": without it Bedrock returns NO thinking text, so
+        # clients (openclaw /reasoning, the Fleet Observatory) see an empty
+        # reasoning block, and a long think streams nothing (idle watchdogs
+        # fire). Accepted by every adaptive model in the catalog (live probe
+        # 2026-10-08: opus 4.7/4.8/5/5.5, sonnet 4.6/5/5.5, haiku 5.5); output
+        # tokens unchanged; the summary arrives as reasoningContent deltas.
+        amrf["thinking"] = {"type": "adaptive", "display": "summarized"}
     if thinking_on and effort:
         amrf["output_config"] = {"effort": effort}
     if amrf:
         kwargs["additionalModelRequestFields"] = amrf
+    if prompt_cache:
+        info = _add_cache_points(kwargs, cache_key)
+        # Hashes only, never prompt text: shows whether a client's tools/system
+        # prefix is stable across turns, which decides whether caching can pay.
+        _cache_log.info("prompt-cache model=%s tools=%s system=%s messages=%d history=%s placed=%s%s",
+                    cache_key, info["tools"], info["system"], info["n_messages"],
+                    info["history"], ",".join(info["placed"]) or "none",
+                    f" diverge={info['diverge']}" if info["diverge"] else "")
     return kwargs
 
 
@@ -388,14 +606,20 @@ def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
 
 def _usage(u: dict | None) -> dict:
     u = u or {}
+    read = u.get("cacheReadInputTokens", 0) or 0
+    write = u.get("cacheWriteInputTokens", 0) or 0
+    # OpenAI convention: prompt_tokens INCLUDES cached tokens (Converse's
+    # inputTokens excludes them), with the cached share in prompt_tokens_details.
+    # openclaw reads only these two fields, so before 2026-10-03 a cached
+    # 220K-token turn looked like a 6-token prompt to the sleep-cycle
+    # context-nap, which therefore never fired (same fix as the Kaizen shim).
     return {
-        "prompt_tokens": u.get("inputTokens", 0),
+        "prompt_tokens": (u.get("inputTokens", 0) or 0) + read + write,
         "completion_tokens": u.get("outputTokens", 0),
         "total_tokens": u.get("totalTokens", 0),
-        # Passed through so callers (e.g. the sleep-cycle context-nap) can see
-        # the true prompt size including cached tokens.
-        "cache_read_input_tokens": u.get("cacheReadInputTokens", 0),
-        "cache_write_input_tokens": u.get("cacheWriteInputTokens", 0),
+        "prompt_tokens_details": {"cached_tokens": read},
+        "cache_read_input_tokens": read,
+        "cache_write_input_tokens": write,
     }
 
 
@@ -420,7 +644,9 @@ def converse_to_openai(resp: dict, public_id: str, completion_id: str, created: 
             {
                 "index": 0,
                 "message": msg,
-                "finish_reason": _FINISH_REASON.get(resp.get("stopReason", ""), "stop"),
+                "finish_reason": _finish_reason(resp.get("stopReason")),
+                # Raw Converse stopReason; finish_reason folds several into one.
+                "upstream_stop_reason": resp.get("stopReason"),
             }
         ],
         "usage": _usage(resp.get("usage")),
@@ -432,7 +658,7 @@ async def complete(
     defaults: "InferenceDefaults | None" = None,
 ) -> dict:
     """Non-streaming completion. boto3 is sync, so run it off the event loop."""
-    kwargs = openai_to_converse(body, defaults)
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id), cache_key=model_id)
     try:
         resp = await asyncio.to_thread(_client(region).converse, modelId=model_id, **kwargs)
     except Exception:
@@ -441,9 +667,11 @@ async def complete(
             model_id, public_id, region,
         )
         raise
-    return converse_to_openai(
+    out = converse_to_openai(
         resp, public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
     )
+    _log_outcome(model_id, public_id, resp.get("stopReason"), out["usage"], streamed=False)
+    return out
 
 
 def _sse(obj: dict) -> bytes:
@@ -453,14 +681,20 @@ def _sse(obj: dict) -> bytes:
 async def stream(
     model_id: str, body: dict, region: str, public_id: str,
     defaults: "InferenceDefaults | None" = None,
+    outcome: dict | None = None,
 ) -> AsyncIterator[bytes]:
     """Streaming completion as OpenAI SSE chunks.
 
     boto3's converse_stream returns a synchronous EventStream; iterate it in a
     worker thread and hand chunks to the async generator via a queue so the
     FastAPI event loop is never blocked.
+
+    `outcome`, when given, is filled as the stream ends with "stop_reason"
+    (raw Converse), "finish_reason" and "usage" (always captured, whether or
+    not the client asked for a usage frame) so the caller can write them to
+    the usage ledger.
     """
-    kwargs = openai_to_converse(body, defaults)
+    kwargs = openai_to_converse(body, defaults, prompt_cache=supports_prompt_cache(model_id), cache_key=model_id)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
@@ -500,6 +734,7 @@ async def stream(
     # Open with the assistant role so clients see a well-formed first chunk.
     yield _sse(base({"role": "assistant"}))
     finish_reason = "stop"
+    stop_reason: str | None = None
     usage: dict | None = None
     # Converse indexes content blocks (text and tool calls share one sequence);
     # OpenAI indexes tool_calls on their own. Map block index -> tool_call index.
@@ -511,6 +746,7 @@ async def stream(
             break
         if kind == "error":
             # Emit a terminal error frame, then close cleanly.
+            stop_reason = "gateway_error"
             yield _sse(base({}, "stop") | {"error": str(payload)})
             break
         event = payload
@@ -546,13 +782,17 @@ async def stream(
                 if rt:
                     yield _sse(base({"reasoning_content": rt}))
         elif "messageStop" in event:
-            finish_reason = _FINISH_REASON.get(
-                event["messageStop"].get("stopReason", ""), "stop"
-            )
-        elif "metadata" in event and include_usage:
+            stop_reason = event["messageStop"].get("stopReason")
+            finish_reason = _finish_reason(stop_reason)
+        elif "metadata" in event:
             usage = _usage(event["metadata"].get("usage"))
 
+    if outcome is not None:
+        outcome.update(stop_reason=stop_reason, finish_reason=finish_reason, usage=usage)
+    _log_outcome(model_id, public_id, stop_reason, usage, streamed=True)
     final = base({}, finish_reason)
+    if stop_reason:
+        final["choices"][0]["upstream_stop_reason"] = stop_reason
     if include_usage and usage is not None:
         final["usage"] = usage
     yield _sse(final)

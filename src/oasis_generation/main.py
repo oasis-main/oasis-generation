@@ -16,6 +16,8 @@ Provider keys live only here (the gateway), so bot egress collapses to
 gateway + Telegram. Wake-on-request lands behind the same routes later (GEN-004).
 """
 
+import asyncio
+import logging
 import os
 import re
 
@@ -25,7 +27,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from pydantic import BaseModel
 
-from . import bedrock, mantle, wiring
+from . import bedrock, browser_stream, mantle, wiring
+from .browser_stream import ApiError
+from .capability import check_inference_allowed, check_jwks_url
 from .byok import ByokError
 from .catalog import CatalogEntry, enabled_models, resolve
 from .config import Settings, get_settings
@@ -35,18 +39,83 @@ from .remote import TARGETS, RouteStore, read_secret_file, token_matches
 app = FastAPI(title="oasis-generation", version="0.0.1")
 
 
-@app.on_event("startup")
-def _refuse_open_deployment() -> None:
-    """An internet-facing gateway with no tokens would serve anyone (GEN-008)."""
-    s = get_settings()
-    if s.require_auth and not s.tokens:
+logger = logging.getLogger(__name__)
+
+
+def check_startup_config(s: Settings) -> None:
+    """Refuse to start a deployment that would serve without auth.
+
+    GEN-008: an internet-facing gateway (require_auth) with no service tokens.
+    ORG-171: capability or both mode without a JWKS URL or an issuer (then no
+    token could be verified, and nothing must fall back to "no auth")."""
+    if s.auth_mode == "service" and s.require_auth and not s.tokens:
         raise RuntimeError(
             "OASIS_GENERATION_REQUIRE_AUTH is set but OASIS_GENERATION_SERVICE_TOKENS is empty; refusing to start"
         )
+    if s.auth_mode == "both" and s.require_auth and not s.tokens:
+        raise RuntimeError(
+            "OASIS_GENERATION_REQUIRE_AUTH is set but OASIS_GENERATION_SERVICE_TOKENS is empty; refusing to start"
+        )
+    if s.capability_enabled:
+        if not s.capability_issuer or not s.capability_jwks_url:
+            raise RuntimeError(
+                f"OASIS_GENERATION_AUTH_MODE={s.auth_mode} needs CAPABILITY_JWKS_URL and "
+                "CAPABILITY_ISSUER; refusing to start"
+            )
+        check_jwks_url(s.capability_jwks_url)
+
+
+def _refuse_open_deployment() -> None:
+    check_startup_config(get_settings())
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    s = get_settings()
+    check_startup_config(s)
+    if s.capability_enabled:
+        rt = browser_stream.runtime(s)
+        rt.meter.check_writable()
+        rt.start_bridge(s)
+        app.state.spool_flusher = asyncio.create_task(_flush_spool_forever(rt))
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    task = getattr(app.state, "spool_flusher", None)
+    if task is not None:
+        task.cancel()
+    rt = browser_stream._runtime
+    if rt is not None and rt.bridge is not None:
+        rt.bridge.stop()
+
+
+async def _flush_spool_forever(rt, interval_s: float = 5.0) -> None:
+    """Resend spooled usage events in the background (interface doc 5.3)."""
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            sent = await asyncio.to_thread(rt.meter.flush)
+            if sent:
+                logger.info("usage spool: resent %d event(s)", sent)
+        except Exception:  # noqa: BLE001 - never let the flusher die
+            logger.exception("usage spool flush failed")
+
+
+@app.exception_handler(ApiError)
+async def _api_error(request: Request, exc: ApiError) -> JSONResponse:
+    return JSONResponse(exc.body(), status_code=exc.status, headers=exc.headers)
 
 
 def check_auth(request: Request, settings: Settings = Depends(get_settings)) -> None:
+    """Service-token auth (the fleet). Never "auth disabled" once capability auth is on."""
+    if settings.auth_mode == "capability":
+        # Capability mode serves only the capability routes; a service-token
+        # route must not become an open, unmetered door when no tokens are set.
+        raise HTTPException(status_code=401, detail="service tokens are not accepted in capability auth mode")
     if not settings.tokens:
+        if settings.auth_mode == "both":
+            raise HTTPException(status_code=401, detail="invalid or missing service token")
         if settings.require_auth:
             raise HTTPException(status_code=503, detail="gateway has no service tokens configured")
         request.state.client = "auth-disabled"
@@ -153,8 +222,18 @@ def health() -> dict:
     return {"status": "ok", "service": "oasis-generation"}
 
 
-@app.get("/v1/models", dependencies=[Depends(check_auth)])
+@app.get("/v1/models")
 async def list_models(request: Request, settings: Settings = Depends(get_settings)):
+    token = browser_stream.bearer(request)
+    use_capability = settings.auth_mode == "capability" or (
+        settings.auth_mode == "both" and token not in settings.token_clients)
+    if use_capability:
+        # ORG-171: any valid token with gen:models; the free tier may list models.
+        browser_stream.check_same_origin(request, settings)
+        await browser_stream.authenticate(token, browser_stream.runtime(settings), "gen:models")
+        request.state.served_by = "local"
+        return _local_models()
+    check_auth(request, settings)
     if _route_of(request, settings) == "remote":
         return await _forward_remote(request, settings, "GET", "/models", None)
     request.state.served_by = "local"
@@ -530,7 +609,12 @@ async def _routed_chat(request: Request, body: dict, settings: Settings, table_h
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_completions(request: Request, settings: Settings = Depends(get_settings)):
-    body = await request.json()
+    if settings.auth_mode == "capability":
+        # Unreachable today (check_auth refuses every caller in this mode); kept
+        # so the body cap holds if this route ever accepts capability tokens.
+        body = await browser_stream.read_json_capped(request, settings.max_chat_body_bytes)
+    else:
+        body = await request.json()
     if _route_of(request, settings) == "remote":
         return await _forward_remote(request, settings, "POST", "/chat/completions", body)
     request.state.served_by = "local"
@@ -596,6 +680,43 @@ async def chat_completions(request: Request, settings: Settings = Depends(get_se
     return await _proxy_openai_compatible(
         body, entry, settings.upstream_base_url, settings, None, request
     )
+
+
+# ---- Browser stream (ORG-171) ------------------------------------------------
+@app.post("/v1/chat/stream")
+async def chat_stream(request: Request, settings: Settings = Depends(get_settings)):
+    """BROWSER_STREAM_CONTRACT.md: capability token, SSE events, metered."""
+    if not settings.capability_enabled:
+        raise ApiError(404, "not_found", "capability auth is not enabled on this gateway")
+    rt = browser_stream.runtime(settings)
+    browser_stream.check_same_origin(request, settings)
+    claims = await browser_stream.authenticate(browser_stream.bearer(request), rt, "gen:chat")
+    decision = check_inference_allowed(claims)
+    if decision == 403:
+        raise ApiError(403, "account_suspended", "the account is suspended")
+    if decision == 402:
+        raise ApiError(402, "payment_required", "add a card to use AI",
+                       extra={"tier": claims.get("tier"), "billing_state": claims.get("billing_state")})
+    if rt.state.is_blocked(claims["sub"]):
+        raise ApiError(429, "spend_cap_reached", "the monthly spend cap is reached",
+                       headers={"Retry-After": str(browser_stream.seconds_to_next_month(rt.clock()))})
+    raw = await browser_stream.read_json_capped(request, settings.max_chat_body_bytes)
+    req = browser_stream.parse_body(raw)
+    entry = resolve(req.model)
+    if entry is None or entry.backend not in browser_stream.STREAM_BACKENDS:
+        raise ApiError(404, "unknown_model", f"unknown or disabled model: {req.model!r}")
+    if not rt.meter.available():
+        raise ApiError(503, "metering_unavailable", "usage metering is unavailable; retry later",
+                       headers={"Retry-After": "30"})
+    if not rt.claim(claims["sub"], req.client_request_id):
+        raise ApiError(409, "request_in_flight", "a request with this client_request_id is still running")
+    request_id = browser_stream.new_request_id()
+    request.state.served_by = "local"
+    gen = browser_stream.stream_session(
+        rt=rt, settings=settings, entry=entry, req=req, claims=claims, request_id=request_id)
+    return StreamingResponse(
+        browser_stream.with_keepalive(gen), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-Id": request_id})
 
 
 # ---- X endpoints (GEN-008) -------------------------------------------------

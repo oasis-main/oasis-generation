@@ -79,6 +79,61 @@ Measured on an M4 Max (Metal, Q4_K_M): 39 tok/s generation, 135 tok/s
 prompt. Note Gemma-4's thinking mode returns reasoning in a separate
 `reasoning_content` field and consumes `max_tokens` budget.
 
+## Capability tokens and the browser stream (ORG-171)
+
+The gateway can also serve browser users of the `/interface` UI, who present a
+short-lived capability token from oasis-auth instead of a service token. The
+token format is `docs/capability-token/CONTRACT.md` v1; the wire format of the
+stream is `docs/capability-token/BROWSER_STREAM_CONTRACT.md`.
+
+`OASIS_GENERATION_AUTH_MODE` selects who may call:
+
+| Mode | Service tokens (the fleet) | Capability tokens |
+|---|---|---|
+| `service` (default) | all routes, as before | refused; `/v1/chat/stream` answers 404 |
+| `capability` | refused (401) on every route | `POST /v1/chat/stream` (scope `gen:chat`), `GET /v1/models` (scope `gen:models`) |
+| `both` | all routes, as before | the same two routes; a bearer that is not a configured service token is checked as a capability token |
+
+In `capability` and `both` mode the gateway refuses to start without
+`CAPABILITY_JWKS_URL` and `CAPABILITY_ISSUER`, and an empty service-token list
+never means "auth disabled".
+
+Each capability call on `/v1/chat/stream` publishes one usage event to the MQ
+topic `oasis/system/gen/usage/output` (QoS 1), also for a stopped or failed call.
+A failed publish goes to a JSON-lines spool in `USAGE_SPOOL_DIR` and is resent
+every 5 s. When the spool holds more than `USAGE_SPOOL_MAX` events, when its
+oldest event is 10 minutes old, or when the spool cannot be written, new metered
+requests get 503 `metering_unavailable`. In the usage event, `tokens_in` excludes
+the cache read and cache write tokens, which have their own fields. When the
+upstream sent no usage block (a stopped or failed call), the event carries an
+estimate (4 characters per token) and `"usage_estimated": true`.
+
+The gateway subscribes to `oasis/system/auth/revocation/output` (revoked `jti`,
+per-`sub` not-before) and `oasis/system/auth/billing/output` (`blocked` subs get
+429 `spend_cap_reached`). If the broker is down, the gateway keeps the last state.
+
+Tool calls in the stream: `tool_call` frames with `partial: true` carry argument
+fragments to append; the last frame for each call has `partial: false` and the
+complete `arguments`. Every tool in the request is a client tool, so a turn that
+calls one ends with `done.finish_reason = "tool_calls"`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OASIS_GENERATION_AUTH_MODE` | `service` | `service`, `capability` or `both` |
+| `CAPABILITY_JWKS_URL` | empty | oasis-auth JWKS (https; http only for a loopback host) |
+| `CAPABILITY_ISSUER` | empty | exact `iss`, e.g. `https://auth.dev.cloud.oasis-x.io` |
+| `OASIS_GENERATION_STREAM_ALLOWED_ORIGINS` | empty | extra exact origins for the same-origin rule (comma list) |
+| `MAX_CHAT_BODY_BYTES` | `1048576` | larger request bodies get 413 `request_too_large` |
+| `MQTT_HOST` | empty | broker host; empty = no broker (events are spooled only) |
+| `MQTT_PORT` | `1883` | broker port |
+| `MQTT_USERNAME` | `mq-service-gen` | service login name |
+| `MQTT_SERVICE_SECRET` | empty | service login password (a secret: inject it, never commit it) |
+| `MQTT_CLIENT_ID` | `oasis-gen-gateway` | client id prefix; a random 6-hex suffix is always added |
+| `USAGE_SPOOL_DIR` | `/tmp/oasis-generation/usage-spool` | spool directory, writable by uid 10001 |
+| `USAGE_SPOOL_MAX` | `1000` | spool size limit for the 503 rule |
+
+Each unprefixed variable is also read as `OASIS_GENERATION_<NAME>`.
+
 ## Tests
 
 ```sh

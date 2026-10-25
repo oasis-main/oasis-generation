@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -710,11 +711,22 @@ async def stream(
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    # Set when this generator is closed early (the client went away, ORG-171
+    # browser stream). The worker then closes the Converse event stream, which
+    # ends the upstream call instead of reading it to the end.
+    stop = threading.Event()
 
     def worker() -> None:
         try:
             resp = _client(region).converse_stream(modelId=model_id, **kwargs)
-            for event in resp["stream"]:
+            events = resp["stream"]
+            for event in events:
+                if stop.is_set():
+                    close = getattr(events, "close", None)
+                    if close is not None:
+                        close()
+                    logger.info("bedrock stream() cancelled by the caller model_id=%s", model_id)
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
         except Exception as exc:  # surface upstream errors into the stream
             # Previously this was swallowed with no server-side trace at all —
@@ -730,7 +742,16 @@ async def stream(
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
     loop.run_in_executor(None, worker)
+    try:
+        async for frame in _relay(queue, base, outcome, model_id, public_id, include_usage):
+            yield frame
+    finally:
+        stop.set()
 
+
+async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> AsyncIterator[bytes]:
+    """The queue -> OpenAI SSE half of stream(); split out so stream() can
+    signal the worker in a finally block when its caller closes it early."""
     # Open with the assistant role so clients see a well-formed first chunk.
     yield _sse(base({"role": "assistant"}))
     finish_reason = "stop"

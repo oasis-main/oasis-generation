@@ -12,6 +12,10 @@ dependencies = [
   # Bedrock backend (GEN-003 provider fanout). Pure-Python; keeps the gateway
   # CPU-slim (no torch/CUDA — that stays in the runner-vllm extra).
   "boto3>=1.35",
+  # ORG-171 capability tokens (Ed25519 signature check) and the MQ client for
+  # usage events and the revocation / billing topics.
+  "cryptography>=42",
+  "paho-mqtt>=2.1",
 ]
 
 # The gateway stays CPU-slim; the GPU serving stack is an extra so the

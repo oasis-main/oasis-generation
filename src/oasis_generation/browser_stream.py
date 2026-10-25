@@ -90,7 +90,7 @@ class CapabilityRuntime:
         self._inflight: dict[tuple[str, str], float] = {}
 
     def claim(self, sub: str, crid: str) -> bool:
-        """Mark (sub, client_request_id) running; False if it already runs.
+        """Record (sub, client_request_id) as running; False if it already runs.
 
         An entry older than the upstream timeout is treated as gone: a stream
         whose generator never started cannot then block that id for ever."""

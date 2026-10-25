@@ -6,8 +6,16 @@ Everything comes from the environment so the same image runs locally
 
 import os
 from functools import lru_cache
+from typing import Literal
 
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings
+
+
+def _env(name: str, default):
+    """A setting read from the unprefixed name in the ORG-171 interface doc
+    (section 5.4) or, as a fallback, from OASIS_GENERATION_<name>."""
+    return Field(default, validation_alias=AliasChoices(name, f"OASIS_GENERATION_{name}"))
 
 
 class Settings(BaseSettings):
@@ -62,7 +70,44 @@ class Settings(BaseSettings):
     # /genroute). Comma list of client names, "*" = every token client, "" = none.
     self_switch_clients: str = ""
 
-    model_config = {"env_prefix": "OASIS_GENERATION_"}
+    # ── ORG-171 capability tokens (browser and paid users) ──
+    # service    = today's service tokens only (default; existing deployments
+    #              do not change).
+    # capability = capability tokens only (contract v1): /v1/chat/stream and
+    #              /v1/models. Every service-token route answers 401.
+    # both       = a token that is a configured service token takes the service
+    #              path; any other bearer is checked as a capability token.
+    auth_mode: Literal["service", "capability", "both"] = "service"
+    # The oasis-auth JWKS (https; http only for a loopback host) and the exact
+    # `iss` the tokens must carry, e.g. https://auth.dev.cloud.oasis-x.io.
+    capability_jwks_url: str = _env("CAPABILITY_JWKS_URL", "")
+    capability_issuer: str = _env("CAPABILITY_ISSUER", "")
+    # Extra exact origins (comma list) allowed to call /v1/chat/stream besides
+    # the request's own host, e.g. http://localhost:5173 for a local UI.
+    stream_allowed_origins: str = ""
+    # Largest /v1/chat/stream body (and /v1/chat/completions body in capability
+    # mode) the gateway reads; larger bodies get 413 request_too_large.
+    max_chat_body_bytes: int = _env("MAX_CHAT_BODY_BYTES", 1_048_576)
+
+    # ── ORG-171 usage events (interface doc 5.3) ──
+    # Empty MQTT_HOST = no broker: usage events go to the spool, and the 503
+    # metering_unavailable rule stops metered requests after 10 minutes.
+    mqtt_host: str = _env("MQTT_HOST", "")
+    mqtt_port: int = _env("MQTT_PORT", 1883)
+    mqtt_username: str = _env("MQTT_USERNAME", "mq-service-gen")
+    mqtt_service_secret: SecretStr = _env("MQTT_SERVICE_SECRET", SecretStr(""))
+    # A random suffix is always added, so two gateway tasks never share an id.
+    mqtt_client_id: str = _env("MQTT_CLIENT_ID", "oasis-gen-gateway")
+    # Must be writable by uid 10001. /tmp works in any container (ephemeral:
+    # a spool there is lost when the task stops); point it at a volume to keep it.
+    usage_spool_dir: str = _env("USAGE_SPOOL_DIR", "/tmp/oasis-generation/usage-spool")
+    usage_spool_max: int = _env("USAGE_SPOOL_MAX", 1000)
+
+    model_config = {"env_prefix": "OASIS_GENERATION_", "populate_by_name": True}
+
+    @property
+    def capability_enabled(self) -> bool:
+        return self.auth_mode in ("capability", "both")
 
     @property
     def remote_configured(self) -> bool:

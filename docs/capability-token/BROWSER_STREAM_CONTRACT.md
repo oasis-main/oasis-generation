@@ -22,6 +22,8 @@ Response: `200 text/event-stream`. Each frame is `event: <type>` + `data: <json>
 
 Exactly one of `done` or `error` ends a stream. A stream cut without either is a failure.
 
+The server may send SSE comment lines (`: ping`) as keepalive; clients ignore them.
+
 Retries and billing. Every upstream call is billed, including a retry after a cut stream; a retry is a new call and costs money. `client_request_id` has one job: while a request with the same id (same `sub`) is still running, a second one is refused with 409 `request_in_flight`. Once the first has ended, the same id may be sent again and is billed as a new call.
 
 Stop. When the browser closes the stream (abort, tab close), the gateway cancels the upstream call and bills the tokens used up to that point. The final `usage` frame may be missing; the bill comes from the gateway ledger, not from the stream.
@@ -37,6 +39,7 @@ Errors before the stream opens are plain JSON `{"error": {"code","message"}}` wi
 | 403 | `account_suspended`, `missing_scope` or `cross_origin` | show the message |
 | 429 | `spend_cap_reached` / `rate_limited` | show cap and reset date from `Retry-After` |
 | 409 | `request_in_flight` | the same `client_request_id` is still running; wait or abort the first |
+| 413 | `request_too_large` | the request body is larger than the gateway cap (default 1 MiB); shorten the conversation |
 | 503 | `metering_unavailable` | the gateway refuses unmetered inference; retry later |
 
 `GET /v1/models` (scope `gen:models`) works on the free tier and returns the public model list.

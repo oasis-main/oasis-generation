@@ -245,3 +245,14 @@ def test_client_id_gets_a_unique_suffix():
     a = m.unique_client_id("oasis-gen-gateway")
     b = m.unique_client_id("oasis-gen-gateway")
     assert a.startswith("oasis-gen-gateway-") and a != b
+    assert len(a) == len("oasis-gen-gateway-") + 6
+
+
+def test_check_writable(tmp_path):
+    ok = m.UsageMeter(None, str(tmp_path / "spool"))
+    assert ok.check_writable() and ok.available()
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    bad = m.UsageMeter(None, str(blocker / "spool"))
+    assert bad.check_writable() is False
+    assert not bad.available()

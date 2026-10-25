@@ -150,6 +150,24 @@ class UsageMeter:
                 logger.error("usage spool write failed (%s); event %s lost; metering unavailable",
                              exc, event.get("event_id"))
 
+    def check_writable(self) -> bool:
+        """Startup probe: can the spool directory take a file? If not, metering
+        is unavailable from the start (fail closed), not after the first failed
+        publish."""
+        probe = os.path.join(self.spool_dir, ".write-probe")
+        try:
+            os.makedirs(self.spool_dir, exist_ok=True)
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write("ok")
+            os.remove(probe)
+            return True
+        except OSError as exc:
+            logger.error("usage spool dir %s is not writable (%s): metering unavailable",
+                         self.spool_dir, exc)
+            with self._lock:
+                self._broken = True
+            return False
+
     def flush(self) -> int:
         """Resend spooled events in order; stop at the first failure. Returns the number sent."""
         with self._lock:
@@ -206,7 +224,7 @@ class UsageMeter:
 
 def unique_client_id(prefix: str) -> str:
     """Two gateway tasks with one client id would disconnect each other."""
-    return f"{prefix}-{secrets.token_hex(4)}"
+    return f"{prefix}-{secrets.token_hex(3)}"
 
 
 def _rc_ok(rc: Any) -> bool:

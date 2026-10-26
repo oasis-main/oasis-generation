@@ -690,7 +690,9 @@ async def chat_stream(request: Request, settings: Settings = Depends(get_setting
         raise ApiError(404, "not_found", "capability auth is not enabled on this gateway")
     rt = browser_stream.runtime(settings)
     browser_stream.check_same_origin(request, settings)
-    claims = await browser_stream.authenticate(browser_stream.bearer(request), rt, "gen:chat")
+    # Billing first, scope second: a free or unpaid account gets 402 (or 403
+    # suspended), not missing_scope, because its token carries only gen:models.
+    claims = await browser_stream.authenticate(browser_stream.bearer(request), rt, None)
     decision = check_inference_allowed(claims)
     if decision == 403:
         raise ApiError(403, "account_suspended", "the account is suspended")
@@ -700,6 +702,7 @@ async def chat_stream(request: Request, settings: Settings = Depends(get_setting
     if rt.state.is_blocked(claims["sub"]):
         raise ApiError(429, "spend_cap_reached", "the monthly spend cap is reached",
                        headers={"Retry-After": str(browser_stream.seconds_to_next_month(rt.clock()))})
+    browser_stream.require_scope(claims, "gen:chat")
     raw = await browser_stream.read_json_capped(request, settings.max_chat_body_bytes)
     req = browser_stream.parse_body(raw)
     entry = resolve(req.model)

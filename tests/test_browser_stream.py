@@ -324,6 +324,26 @@ def test_free_tier_402_with_tier_and_billing_state(cap):
     assert err["code"] == "payment_required" and err["tier"] == "free" and err["billing_state"] == "none"
 
 
+def test_free_tier_token_as_issued_gets_402_not_missing_scope(cap):
+    # oasis-auth gives a free token only gen:models (ORG-171 interface doc 1).
+    r = client.post("/v1/chat/stream", json=body(),
+                    headers=auth(token(tier="free", billing_state="none", scopes=["gen:models"])))
+    assert r.status_code == 402
+    assert r.json()["error"]["code"] == "payment_required"
+
+
+def test_unpaid_paid_tier_without_chat_scope_gets_402(cap):
+    r = client.post("/v1/chat/stream", json=body(),
+                    headers=auth(token(tier="personal", billing_state="none", scopes=["gen:models"])))
+    assert _err(r) == (402, "payment_required")
+
+
+def test_suspended_token_as_issued_gets_403_suspended(cap):
+    r = client.post("/v1/chat/stream", json=body(),
+                    headers=auth(token(billing_state="suspended", scopes=["gen:models"])))
+    assert _err(r) == (403, "account_suspended")
+
+
 def test_suspended_403(cap):
     assert _err(client.post("/v1/chat/stream", json=body(),
                             headers=auth(token(billing_state="suspended")))) == (403, "account_suspended")

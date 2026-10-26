@@ -139,7 +139,10 @@ def bearer(request) -> str:
     return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
 
 
-async def authenticate(token: str, rt: CapabilityRuntime, scope: str) -> dict:
+async def authenticate(token: str, rt: CapabilityRuntime, scope: str | None) -> dict:
+    """Verify a capability token. `scope=None` checks everything except the
+    scope, so a metered route can answer 402/403 for billing before it checks
+    the scope (a free token carries only gen:models; ORG-171)."""
     if not token:
         raise ApiError(401, "invalid_token", "missing bearer token")
     jwks = await rt.jwks.get(peek_kid(token))
@@ -153,6 +156,12 @@ async def authenticate(token: str, rt: CapabilityRuntime, scope: str) -> dict:
     if r.reason == "missing_scope":
         raise ApiError(403, "missing_scope", f"capability token lacks scope {scope}")
     raise ApiError(401, "invalid_token", f"capability token refused: {r.reason}")
+
+
+def require_scope(claims: dict, scope: str) -> None:
+    """403 missing_scope when a verified token lacks `scope`."""
+    if scope not in claims.get("scopes", []):
+        raise ApiError(403, "missing_scope", f"capability token lacks scope {scope}")
 
 
 _LOOPBACK = ("localhost", "127.0.0.1", "::1")

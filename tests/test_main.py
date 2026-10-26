@@ -32,10 +32,13 @@ def test_models_lists_only_enabled():
     assert "claude-opus-4-8" in ids
     assert "claude-sonnet-5" in ids
     assert "glm-5" in ids
-    # Roster trim: these were removed 2026-07-24.
-    for removed in ("claude-sonnet-4-6", "claude-haiku-4-5", "gpt-oss-120b",
-                    "deepseek-v3.2", "llama-4-maverick"):
+    # Roster trim: these were removed 2026-07-24 and stay gone.
+    for removed in ("gpt-oss-120b", "deepseek-v3.2", "llama-4-maverick"):
         assert removed not in ids
+    # claude-sonnet-4-6 and claude-haiku-4-5 came back with the cheaper tier
+    # (47fc573, 2026-08-30) and are served from Bedrock (ADM-053).
+    assert "claude-sonnet-4-6" in ids
+    assert "claude-haiku-4-5" in ids
     # GPT-5.6-sol is live via the bedrock_mantle (Responses) backend.
     assert "gpt-5.6-sol" in ids
     # The openai_compat template stays disabled until a key is provided.

@@ -12,7 +12,7 @@ import yaml
 from .byok import ByokRegistry
 from .config import Settings
 from .routes import HotRouteTable
-from .xservice import LabelSet, LabelSets, XService
+from .xservice import LabelSet, LabelSets, QuestionSet, QuestionSets, XService
 
 _routes: dict[str, HotRouteTable] = {}
 _byok: dict[str, ByokRegistry] = {}
@@ -43,14 +43,19 @@ def byok(settings: Settings) -> ByokRegistry:
 
 
 def xservice(settings: Settings) -> XService:
-    key = (settings.decider_url, settings.labelsets_file, settings.x_timeout_s)
+    key = (settings.decider_url, settings.labelsets_file, settings.question_sets_file, settings.x_timeout_s)
     if key not in _x:
         ls = LabelSets()
         if settings.labelsets_file:
             with open(settings.labelsets_file, encoding="utf-8") as fh:
                 for item in (yaml.safe_load(fh) or {}).get("labelsets", []):
                     ls.register(LabelSet.model_validate(item))
-        _x[key] = XService(settings.decider_url, ls, timeout_s=settings.x_timeout_s)
+        qs = QuestionSets()
+        if settings.question_sets_file:
+            with open(settings.question_sets_file, encoding="utf-8") as fh:
+                for item in (yaml.safe_load(fh) or {}).get("question_sets", []):
+                    qs.register(QuestionSet.model_validate(item))
+        _x[key] = XService(settings.decider_url, ls, timeout_s=settings.x_timeout_s, question_sets=qs)
     return _x[key]
 
 

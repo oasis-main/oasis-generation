@@ -52,7 +52,10 @@ class Settings(BaseSettings):
     byok_extra_ports: str = ""
     # Extra X label sets (yaml list of LabelSet); gate.v1 is built in.
     labelsets_file: str = ""
-    # The decider sidecar behind /v1/x/decide and /v1/gate.
+    # Extra X question sets (yaml list of QuestionSet under `question_sets`);
+    # reviewer.toolcall.v1 is built in.
+    question_sets_file: str = ""
+    # The decider sidecar behind /v1/x/decide, /v1/x/decide-set and /v1/gate.
     decider_url: str = "http://oasis-decider:8790/v1/decide"
     x_timeout_s: float = 10.0
 

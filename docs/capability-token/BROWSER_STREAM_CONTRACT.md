@@ -43,6 +43,7 @@ Errors before the stream opens are plain JSON `{"error": {"code","message"}}` wi
 | 503 | `metering_unavailable` | the gateway refuses unmetered inference; retry later |
 
 `GET /v1/models` (scope `gen:models`) works on the free tier and returns the public model list.
+Each model has `capabilities.supports_client_tools` (bool). Send a `tools` array only to a model where it is `true`: the flag is set per catalog entry after `scripts/probe_client_tools.py` showed that the model, on its backend, ends a stream with `tool_calls` and answers after a `role:"tool"` result. For any other model, send no `tools`.
 Open item (needs one decision with Hello World): the UI proposes the Vercel AI SDK UI message stream. Choose one: (a) this contract, as is; or (b) the AI SDK protocol, with a thin adapter in oasis-ai that maps these events to it. Until chosen, Hello World builds against this file. The choice is made by changing this file by PR.
 
 Mock: serve the table above from a static file; the mock must emit one stream per event type and one pre-stream response per status.

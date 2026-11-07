@@ -121,6 +121,12 @@ class CatalogEntry(BaseModel):
     # Per-model inference policy (thinking/effort/temperature/profiles). None =
     # legacy passthrough (no gateway-side param injection).
     inference: InferenceDefaults | None = None
+    # Client tools (BROWSER_STREAM_CONTRACT "Tools"): True only after
+    # scripts/probe_client_tools.py showed that this model, on its backend,
+    # ends a stream with finish_reason=tool_calls and valid JSON arguments.
+    # The oasis-ai interface sends its `ui_*` tools only to a model with
+    # `supports_client_tools`, so an unchecked model gets plain chat.
+    client_tools: bool = False
     notes: str = ""
 
     def capabilities(self) -> dict:
@@ -144,6 +150,7 @@ class CatalogEntry(BaseModel):
                 "max_output_tokens_ceiling": None,
                 "profiles": [],
                 "default_profile": None,
+                "supports_client_tools": self.client_tools,
             }
         thinking_on = inf.thinking in ("adaptive", "always_on")
         # Effort choices, in profile order (fast->balanced->deep), deduped.
@@ -166,6 +173,7 @@ class CatalogEntry(BaseModel):
             "max_output_tokens_ceiling": max(ceilings) if ceilings else None,
             "profiles": list(inf.profiles.keys()),
             "default_profile": inf.default_profile,
+            "supports_client_tools": self.client_tools,
         }
 
 

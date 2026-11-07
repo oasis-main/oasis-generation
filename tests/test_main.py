@@ -68,6 +68,16 @@ def test_models_expose_capability_descriptors():
     assert gemma["max_output_tokens_ceiling"] == 8192
 
 
+def test_models_expose_supports_client_tools():
+    data = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    # Every model says whether the browser may send it client tools.
+    assert all(isinstance(m["capabilities"]["supports_client_tools"], bool) for m in data.values())
+    # Only models that passed scripts/probe_client_tools.py carry True.
+    from oasis_generation.catalog import resolve
+    for mid, m in data.items():
+        assert m["capabilities"]["supports_client_tools"] is resolve(mid).client_tools
+
+
 def test_unknown_model_404s():
     resp = client.post("/v1/chat/completions", json={"model": "nope", "messages": []})
     assert resp.status_code == 404

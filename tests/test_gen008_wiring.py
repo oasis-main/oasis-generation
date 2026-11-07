@@ -87,17 +87,27 @@ def test_gate_and_decide_endpoints(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     svc = wiring.xservice(get_settings())
 
-    async def caller(url, body, t):
-        return {"decVerdictProbs": {"allow": 0.98, "escalate": 0.01, "deny": 0.01}}
+    sent = []
+
+    async def caller(url, body, t):   # the oasis-decider sidecar's answer shape (laya 0.4.0)
+        sent.append(body)
+        return {"answers": {"decision": {"type": "choice", "choice": "allow", "probabilities": {
+            "allow": 0.98, "escalate": 0.01, "deny": 0.01, "out_of_scope": 0.0}}},
+            "model": "laya", "revision": "r", "ms": 1.0, "usage": {}}
     svc._call = caller
     h = {"Authorization": "Bearer tl"}
     g = client.post("/v1/gate", headers=h, json={"model": "m", "action": {"tool": "x"}, "baseline": "allow"})
     assert g.status_code == 200 and g.json()["verdict"] == "allow"
+    assert set(sent[-1]) == {"state", "questions"}    # T12: the sidecar's request shape
     g = client.post("/v1/gate", headers=h, json={"model": "m", "action": {}})
     assert g.json()["verdict"] == "escalate"          # no baseline -> cannot pass a bare allow
     assert client.post("/v1/gate", headers=h, json={"model": "m", "action": {}, "baseline": "zz"}).status_code == 422
-    d = client.post("/v1/x/decide", headers=h, json={"model": "m", "labelset_id": "gate.v1", "ctx": {}})
+    d = client.post("/v1/x/decide", headers=h, json={"model": "m", "labelset_id": "gate.v1",
+                                                     "ctx": {"tool": "exec", "cmd": "git status"}})
     assert d.status_code == 200 and d.json()["chosen"] == "allow"
+    n = len(sent)
+    d = client.post("/v1/x/decide", headers=h, json={"model": "m", "labelset_id": "gate.v1", "ctx": {}})
+    assert d.status_code == 200 and d.json()["abstain"] and len(sent) == n   # empty ctx: abstain, no call
     assert client.post("/v1/x/decide", headers=h, json={"model": "m", "labelset_id": "nope"}).status_code == 404
     assert client.post("/v1/gate", json={"model": "m", "action": {}}).status_code == 401   # auth enforced
     _teardown()

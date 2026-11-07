@@ -736,12 +736,29 @@ class GateIn(BaseModel):
     baseline: str | None = None   # tighten-only floor; absent = "escalate"
 
 
+class DecideSetIn(BaseModel):
+    model: str
+    question_set_id: str
+    ctx: dict | list | str | None = None
+
+
 @app.post("/v1/x/decide", dependencies=[Depends(check_auth)])
 async def x_decide(body: DecideIn, settings: Settings = Depends(get_settings)):
     """Stateless X call. Returns the x_decision record; failures abstain, never 5xx."""
     try:
         return await wiring.xservice(settings).decide(
             model=body.model, labelset_id=body.labelset_id, ctx=body.ctx)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'\"")) from exc
+
+
+@app.post("/v1/x/decide-set", dependencies=[Depends(check_auth)])
+async def x_decide_set(body: DecideSetIn, settings: Settings = Depends(get_settings)):
+    """Stateless X call for a registered question set: one backend call answers every
+    question. Failures abstain every answer, never 5xx. No route acts on the answers."""
+    try:
+        return await wiring.xservice(settings).decide_set(
+            model=body.model, question_set_id=body.question_set_id, ctx=body.ctx)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'\"")) from exc
 

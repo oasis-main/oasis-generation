@@ -135,6 +135,7 @@ four to disagree.
 | `POST /v1/sessions` | create session; body picks `mode`, `dag_id`, budgets |
 | `POST /v1/sessions/{id}/events` | user input or tool result in; returns stream of TraceEvents (SSE) |
 | `POST /v1/x/decide` | stateless X call: `{model, labelset_id, ctx}` returns the x_decision record |
+| `POST /v1/x/decide-set` | stateless X call for a registered question set (e.g. `reviewer.toolcall.v1`): `{model, question_set_id, ctx}`; one backend call returns every typed answer (choice, noul, score). No route acts on these answers |
 | `POST /v1/gate` | stateless Gate call for external callers (e.g. oasis-claw reviewer) |
 | `GET /v1/dags`, `PUT /v1/dags/{id}` | list, create, version process DAGs (draft/active) |
 | `GET /v1/sessions/{id}/trace` | full trace, for replay and audit |

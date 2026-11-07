@@ -27,8 +27,9 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from oasis_generation.xservice import (GATE, OUT_OF_SCOPE, VERDICTS, BackendError, DeciderSidecar,
-                                       LabelSet, LabelSets, XService, encode_body)
+from oasis_generation.xservice import (GATE, OUT_OF_SCOPE, REVIEWER_TOOLCALL, VERDICTS, BackendError,
+                                       DeciderSidecar, LabelSet, LabelSets, QuestionSet, QuestionSets,
+                                       XService, encode_body)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CONTRACT = ROOT / "tests" / "contract"
@@ -41,12 +42,13 @@ PRE_FIX_BODY = next(c["body"] for c in RECORDED["cases"] if c["name"] == "pre_fi
 RECORD_HINT = "the adapter's request changed: re-run scripts/record_decider_contract.py"
 
 
-def _live_path() -> pathlib.Path | None:
-    env = os.environ.get("OASIS_DECIDER_SERVER")
+def _live_path(env_var: str = "OASIS_DECIDER_SERVER",
+               rel: str = "oasis-claw/sandbox/decider/decider_server.py") -> pathlib.Path | None:
+    env = os.environ.get(env_var)
     if env:
         return pathlib.Path(env)   # named on purpose: a missing file must fail, not skip
     for base in (ROOT.parent, ROOT.parent.parent):   # main checkout, or a worktree folder
-        p = base / "oasis-claw" / "sandbox" / "decider" / "decider_server.py"
+        p = base / rel
         if p.is_file():
             return p
     return None
@@ -153,23 +155,30 @@ def test_pre_fix_request_is_refused_by_the_sidecar(ds):
 # ---- 2b. the real handler over HTTP, with a fake model in laya's answer shape -------
 
 class FakeLaya:
-    """Answers like laya 0.4.0 (agent.py _decode_answers, choice branch), wrapped
-    like laya's predict() output, then unwrapped by the sidecar's own unwrap()."""
+    """Answers like laya 0.4.0 (agent.py _decode_answers: choice, noul and score
+    branches), wrapped like laya's predict() output, then unwrapped by the sidecar's
+    own unwrap(). `probs` gives choice labels; `p_true` every noul; `levels` a score."""
     name, revision = "fake-laya", "0" * 40
 
-    def __init__(self, ds, probs):
-        self.ds, self.probs, self.calls = ds, probs, []
+    def __init__(self, ds, probs, p_true=0.25, levels=(0.1, 0.2, 0.6, 0.1)):
+        self.ds, self.probs, self.p_true, self.levels, self.calls = ds, probs, p_true, levels, []
 
     def predict(self, state, questions):
         self.calls.append((state, questions))
         answers = {}
+        extra = {"confidence": 0.5, "answer_confidence": 0.5, "action": {"act_probability": 0.5}}
         for qid, q in questions.items():
-            keys = list(q["criteria"])
-            p = {k: self.probs.get(k, 0.0) for k in keys}
-            answers[qid] = {"type": "choice", "choice": max(p, key=p.get),
-                            "probabilities": {k: round(v, 4) for k, v in p.items()},
-                            "confidence": 0.5, "answer_confidence": max(p.values()),
-                            "action": {"act_probability": 0.5}}
+            if q["type"] == "noul":
+                answers[qid] = {"type": "noul", "noul": self.p_true, **extra}
+            elif q["type"] == "score":
+                p = list(self.levels)[:len(q["criteria"])]
+                answers[qid] = {"type": "score", "score": round(sum(i * v for i, v in enumerate(p)), 4),
+                                "legend": {str(i): c for i, c in enumerate(q["criteria"])},
+                                "probabilities": {str(i): round(v, 4) for i, v in enumerate(p)}, **extra}
+            else:
+                p = {k: self.probs.get(k, 0.0) for k in q["criteria"]}
+                answers[qid] = {"type": "choice", "choice": max(p, key=p.get),
+                                "probabilities": {k: round(v, 4) for k, v in p.items()}, **extra}
         return self.ds.unwrap({"model": "laya-rl-agent", "answers": answers,
                                "usage": {"input_tokens": 10, "truncated": False}})
 
@@ -283,3 +292,115 @@ def test_real_image_refused_the_pre_fix_request():
     case = next(c for c in RECORDED["cases"] if c["name"] == "pre_fix_body")
     assert case["status"] == 400
     assert case["response"] == {"error": "state must be a string or an object"}
+
+
+# ---- 4. question sets: one call, many typed questions -------------------------------
+
+STATE = {"bot": "house", "tool": "exec", "family": "shell", "target": "(none)",
+         "params": '{"command": "git status"}', "operator_request": "Check the state of the repo."}
+
+
+def test_reviewer_set_request_passes_sidecar_validate(ds):
+    body = DeciderSidecar().request_set(REVIEWER_TOOLCALL, STATE)
+    state, questions = ds.validate(json.loads(encode_body(body)))
+    assert state == STATE and set(questions) == set(REVIEWER_TOOLCALL.questions)
+    assert len(questions) <= ds.MAX_QUESTIONS
+
+
+def test_reviewer_set_round_trip_over_http(ds):
+    fake = FakeLaya(ds, {"allow": 0.1, "deny": 0.8, "escalate": 0.1}, p_true=0.9)
+    srv, url = _serve(ds, fake)
+    try:
+        r = run(XService(url, timeout_s=10).decide_set(model="laya", question_set_id=REVIEWER_TOOLCALL.id,
+                                                       ctx=STATE))
+        assert r["error"] is None and r["served"]["model"] == "fake-laya"
+        assert len(fake.calls) == 1                                  # one call for all five
+        assert fake.calls[0] == (STATE, {q: v.wire() for q, v in REVIEWER_TOOLCALL.questions.items()})
+        a = r["answers"]
+        assert a["verdict"]["chosen"] == "deny"
+        assert all(a[q]["chosen"] is True for q in ("beyond_request", "injected_instruction", "sends_data_out"))
+        assert a["risk"]["chosen"] == 2 and math.isclose(a["risk"]["expected"], 1.7)
+    finally:
+        srv.shutdown()
+
+
+def test_reviewer_set_busy_sidecar_fails_closed(ds):
+    srv, url = _serve(ds, FakeLaya(ds, {"allow": 1.0}), max_pending=0)
+    try:
+        r = run(XService(url, timeout_s=10).decide_set(model="laya", question_set_id=REVIEWER_TOOLCALL.id,
+                                                       ctx=STATE))
+        assert "503" in r["error"] and all(a["abstain"] for a in r["answers"].values())
+    finally:
+        srv.shutdown()
+
+
+_TS = _live_path("OASIS_REVIEWER_DECIDER_TS", "oasis-claw/extensions/oasis-reviewer/src/decider.ts")
+
+
+@pytest.mark.skipif(_TS is None, reason="no oasis-claw checkout here; set OASIS_REVIEWER_DECIDER_TS to check it")
+def test_reviewer_set_is_verbatim_the_reviewers_tool_call_questions():
+    """reviewer.toolcall.v1 must be the text the reviewer sends (decider.ts
+    TOOL_CALL_QUESTIONS). If this fails, the reviewer's questions changed: register
+    reviewer.toolcall.v2 with the new text; do not edit v1."""
+    src = _TS.read_text(encoding="utf-8")
+    start = src.index("export const TOOL_CALL_QUESTIONS")
+    block = src[start:src.index("\n};\n", start)]
+    pos = 0
+    for qid, q in REVIEWER_TOOLCALL.questions.items():
+        at = block.index(f"\n  {qid}: {{", pos)                 # the questions, in order
+        assert f'type: "{q.type}"' in block[at:at + 80]
+        texts = [q.instructions] + (list(q.criteria.values()) if isinstance(q.criteria, dict)
+                                    else list(q.criteria or []))
+        for t in texts:
+            assert json.dumps(t, ensure_ascii=False) in block, (qid, t)
+        if isinstance(q.criteria, dict):
+            for label, text in q.criteria.items():
+                assert f"{label}: {json.dumps(text, ensure_ascii=False)}" in block, (qid, label)
+        pos = at + 1
+    assert block.count("    type: ") == len(REVIEWER_TOOLCALL.questions)   # no extra question
+
+
+_REAL_SETS = [c for c in RECORDED["cases"] if c.get("question_set_id")]
+
+
+def question_sets() -> QuestionSets:
+    reg = QuestionSets()
+    for d in RECORDED["question_sets"].values():
+        reg.register(QuestionSet.model_validate(d))
+    return reg
+
+
+def test_recorded_question_sets_are_the_registered_ones():
+    assert RECORDED["question_sets"][REVIEWER_TOOLCALL.id] == REVIEWER_TOOLCALL.model_dump(), RECORD_HINT
+    assert {c["name"] for c in _REAL_SETS} == {"reviewer_benign", "reviewer_risky"}
+
+
+@pytest.mark.parametrize("case", _REAL_SETS, ids=[c["name"] for c in _REAL_SETS])
+def test_recorded_set_request_is_what_the_adapter_sends_now(ds, case):
+    qs = question_sets().get(case["question_set_id"])
+    assert DeciderSidecar().request_set(qs, case["ctx"]) == case["body"], RECORD_HINT
+    ds.validate(case["body"])
+
+
+@pytest.mark.parametrize("case", _REAL_SETS, ids=[c["name"] for c in _REAL_SETS])
+def test_real_laya_answers_every_type_in_one_call(case):
+    """The noul and score shapes from the real image, not only from reading the code."""
+    assert case["status"] == 200
+    raw, qs = case["response"], question_sets().get(case["question_set_id"])
+    assert set(raw["answers"]) == set(qs.questions)
+    assert raw["answers"]["beyond_request"]["type"] == "noul" and "noul" in raw["answers"]["beyond_request"]
+    assert set(raw["answers"]["risk"]["probabilities"]) == {"0", "1", "2", "3"}
+    dists, served = DeciderSidecar().parse_set(raw, qs)
+    for qid, q in qs.questions.items():
+        assert list(dists[qid]) == q.options() and math.isclose(sum(dists[qid].values()), 1.0)
+    assert served["usage"]["truncated"] is False
+
+    async def replay(url, body, t):
+        assert body == case["body"]
+        return raw
+    r = run(XService("http://decider/v1/decide", question_sets=question_sets(), caller=replay).decide_set(
+        model="laya", question_set_id=qs.id, ctx=case["ctx"]))
+    assert r["error"] is None
+    assert math.isclose(r["answers"]["risk"]["expected"], raw["answers"]["risk"]["score"], abs_tol=1e-3)
+    for qid in ("beyond_request", "injected_instruction", "sends_data_out"):
+        assert math.isclose(r["answers"][qid]["p_true"], raw["answers"][qid]["noul"])

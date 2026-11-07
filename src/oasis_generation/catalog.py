@@ -121,6 +121,12 @@ class CatalogEntry(BaseModel):
     # Per-model inference policy (thinking/effort/temperature/profiles). None =
     # legacy passthrough (no gateway-side param injection).
     inference: InferenceDefaults | None = None
+    # Client tools (BROWSER_STREAM_CONTRACT "Tools"): True only after
+    # scripts/probe_client_tools.py showed that this model, on its backend,
+    # ends a stream with finish_reason=tool_calls and valid JSON arguments.
+    # The oasis-ai interface sends its `ui_*` tools only to a model with
+    # `supports_client_tools`, so an unchecked model gets plain chat.
+    client_tools: bool = False
     notes: str = ""
 
     def capabilities(self) -> dict:
@@ -144,6 +150,7 @@ class CatalogEntry(BaseModel):
                 "max_output_tokens_ceiling": None,
                 "profiles": [],
                 "default_profile": None,
+                "supports_client_tools": self.client_tools,
             }
         thinking_on = inf.thinking in ("adaptive", "always_on")
         # Effort choices, in profile order (fast->balanced->deep), deduped.
@@ -166,6 +173,7 @@ class CatalogEntry(BaseModel):
             "max_output_tokens_ceiling": max(ceilings) if ceilings else None,
             "profiles": list(inf.profiles.keys()),
             "default_profile": inf.default_profile,
+            "supports_client_tools": self.client_tools,
         }
 
 
@@ -184,6 +192,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-coder-fable5-composer2.5-v1-gguf:Q4_K_M",
         tier="S",
         enabled=True,
+        # client_tools stays False: not probed yet (the runner was not reachable from the probe host, 2026-11-07).
         # Local llama.cpp: thinking is intrinsic (not gateway-controllable); the
         # profiles advertise max_tokens for the UI (small — 36GB-Mac / OOM cap).
         inference=_native_thinking(2048, 4096, 8192),
@@ -196,6 +205,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="huggingface.co/yuxinlu1/gemma-4-12b-agentic-fable5-composer2.5-v2-3.5x-tau2-gguf:Q4_K_M",
         tier="S",
         enabled=True,
+        # client_tools stays False: not probed yet (the runner was not reachable from the probe host, 2026-11-07).
         inference=_native_thinking(2048, 4096, 8192),
         notes="Community distill, tau2-telecom ~55% vs ~15% base (author-run). GEN-002 pass "
         "2026-07-12 incl. exfil-via-tool-injection probe: cleared for personal/fleet use; "
@@ -243,6 +253,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-opus-4-8",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("xhigh"),
         notes="Anthropic Claude Opus 4.8 via Bedrock. Adaptive thinking; effort "
@@ -253,6 +264,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-opus-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("xhigh"),
         notes="Anthropic Claude Opus 5 via Bedrock (added 2026-08-24, ADM-048). Until "
@@ -268,6 +280,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-opus-5-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("xhigh"),
         notes="Anthropic Claude Opus 5.5 via Bedrock (added 2026-09-28). Inference policy "
@@ -283,6 +296,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.openai.gpt-6-astra",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         notes="OpenAI GPT-6 Astra via Bedrock CONVERSE (added 2026-09-28). NOT on the "
         "bedrock-mantle Responses endpoint that serves GPT-5.6: mantle returns 404 'The model "
@@ -297,6 +311,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-sonnet-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("high"),
         notes="Anthropic Claude Sonnet 5 via Bedrock (added 2026-07-24). Adaptive thinking; "
@@ -308,6 +323,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-sonnet-5-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("high"),
         notes="Anthropic Claude Sonnet 5.5 via Bedrock (added 2026-10-07). Inference policy "
@@ -321,6 +337,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-haiku-5-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("high"),
         notes="Anthropic Claude Haiku 5.5 via Bedrock (added 2026-10-07). Unlike Haiku 4.5, it "
@@ -373,6 +390,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-sonnet-4-6",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("high"),
         notes="Anthropic Claude Sonnet 4.6 via Bedrock, replacing the direct "
@@ -383,6 +401,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-opus-4-7",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_adaptive_claude("xhigh"),
         notes="Anthropic Claude Opus 4.7 via Bedrock, replacing the direct "
@@ -393,6 +412,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         # NO adaptive-thinking block. Haiku 4.5 rejects it outright:
         # "adaptive thinking is not supported on this model" (ValidationException,
@@ -410,6 +430,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.amazon.nova-2-lite-v1:0",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         notes="Amazon Nova 2 Lite via Bedrock. Among the cheapest text models on "
         "the account. No thinking/effort controls — inference defaults are left "
@@ -421,6 +442,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.amazon.nova-micro-v1:0",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         notes="Amazon Nova Micro via Bedrock. Cheapest option here; text only, "
         "small context. Intended for high-volume mechanical work where Sonnet is "
@@ -431,6 +453,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="us.meta.llama3-3-70b-instruct-v1:0",
         tier="bedrock",
         enabled=True,
+        # client_tools stays False: Bedrock refuses tool use in streaming mode for this model (probe 2026-11-07).
         backend="bedrock",
         notes="Meta Llama 3.3 70B Instruct via Bedrock. Cheap open-weight "
         "general model; no adaptive thinking. Probed live 2026-08-28 (Converse, "
@@ -441,6 +464,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="zai.glm-5",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock",
         inference=_native_thinking(),
         notes="Z.AI GLM-5 via Bedrock. Kept 2026-07-24 as the interim stand-in for the "
@@ -457,6 +481,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="openai.gpt-5.6-sol",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock_mantle",
         base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
         inference=InferenceDefaults(
@@ -482,6 +507,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="openai.gpt-5.6-luna",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock_mantle",
         base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
         inference=InferenceDefaults(
@@ -508,6 +534,7 @@ CATALOG: list[CatalogEntry] = [
         upstream_id="openai.gpt-5.6-terra",
         tier="bedrock",
         enabled=True,
+        client_tools=True,  # probe_client_tools.py PASS 2026-11-07
         backend="bedrock_mantle",
         base_url="https://bedrock-mantle.us-east-1.api.aws/openai/v1",
         inference=InferenceDefaults(

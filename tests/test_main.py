@@ -68,6 +68,21 @@ def test_models_expose_capability_descriptors():
     assert gemma["max_output_tokens_ceiling"] == 8192
 
 
+def test_models_expose_supports_client_tools():
+    data = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    # Every model says whether the browser may send it client tools.
+    assert all(isinstance(m["capabilities"]["supports_client_tools"], bool) for m in data.values())
+    # Only models that passed scripts/probe_client_tools.py carry True.
+    from oasis_generation.catalog import resolve
+    for mid, m in data.items():
+        assert m["capabilities"]["supports_client_tools"] is resolve(mid).client_tools
+    # Probe run of 2026-11-07: Bedrock Claude passes; Llama 3.3 on Bedrock has no
+    # tool use in streaming mode; the runner models are not probed yet.
+    assert data["claude-haiku-5-5"]["capabilities"]["supports_client_tools"] is True
+    assert data["llama3-3-70b"]["capabilities"]["supports_client_tools"] is False
+    assert data["gemma-4-12b-coder"]["capabilities"]["supports_client_tools"] is False
+
+
 def test_unknown_model_404s():
     resp = client.post("/v1/chat/completions", json={"model": "nope", "messages": []})
     assert resp.status_code == 404

@@ -6,7 +6,8 @@ POST /v1/chat/stream (browser_stream.upstream_chunks + Translator):
   round 1  the request has one tool; the stream gives a complete tool call with
            the right name and valid JSON arguments, and ends with tool_calls.
   round 2  the request adds the assistant tool call and a role "tool" result;
-           the stream gives text and ends with stop (no new tool call needed).
+           the stream gives text and does not repeat the same call (a repeat is
+           a loop: the interface would call the tool again and again).
 
 The result decides `client_tools=True` in catalog.py (supports_client_tools on
 GET /v1/models). This script only reads and reports; it never edits catalog.py.
@@ -50,7 +51,8 @@ TOOL = {
 }
 PROMPT = (
     "This is an automated test of tool calling. Call the tool record_choice with the "
-    "colour blue. Do not write any text before the call."
+    "colour blue. Do not write any text before the call. After the tool result, reply "
+    "with one short sentence that confirms the colour."
 )
 TOOL_RESULT = '{"recorded": true}'
 MAX_TOKENS = 2048     # adaptive thinking shares this ceiling; the "fast" profile keeps it short
@@ -145,6 +147,13 @@ def _valid_call(r: Round) -> str | None:
     return None
 
 
+def _same_args(a: str, b: str) -> bool:
+    try:
+        return json.loads(a or "{}") == json.loads(b or "{}")
+    except json.JSONDecodeError:
+        return a == b
+
+
 async def probe(entry: CatalogEntry, settings: Settings,
                 source: SourceFactory = browser_stream.upstream_chunks) -> Result:
     user = {"role": "user", "content": PROMPT}
@@ -167,7 +176,10 @@ async def probe(entry: CatalogEntry, settings: Settings,
         return Result(entry.public_id, entry.backend, False, f"round 2 failed: {r2.error}", r1, r2)
     if r2.finish == "length":
         return Result(entry.public_id, entry.backend, False, "round 2 hit the token limit", r1, r2)
-    if r2.text_chars == 0 and not r2.tool_calls:
+    if any(c["name"] == TOOL_NAME and _same_args(c["arguments"], call["arguments"]) for c in r2.tool_calls):
+        return Result(entry.public_id, entry.backend, False,
+                      "round 2 repeated the same call after the tool result (a loop)", r1, r2)
+    if r2.text_chars == 0:
         return Result(entry.public_id, entry.backend, False, "round 2 gave no text after the tool result", r1, r2)
     return Result(entry.public_id, entry.backend, True, "ok", r1, r2)
 

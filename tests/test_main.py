@@ -76,6 +76,11 @@ def test_models_expose_supports_client_tools():
     from oasis_generation.catalog import resolve
     for mid, m in data.items():
         assert m["capabilities"]["supports_client_tools"] is resolve(mid).client_tools
+    # Probe run of 2026-11-07: Bedrock Claude passes; Llama 3.3 on Bedrock has no
+    # tool use in streaming mode; the runner models are not probed yet.
+    assert data["claude-haiku-5-5"]["capabilities"]["supports_client_tools"] is True
+    assert data["llama3-3-70b"]["capabilities"]["supports_client_tools"] is False
+    assert data["gemma-4-12b-coder"]["capabilities"]["supports_client_tools"] is False
 
 
 def test_unknown_model_404s():

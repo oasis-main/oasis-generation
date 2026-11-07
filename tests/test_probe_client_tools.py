@@ -91,6 +91,18 @@ def test_no_text_after_the_result_fails():
     assert not r.passed and "no text" in r.reason
 
 
+def test_the_same_call_again_after_the_result_fails():
+    again = _tool_chunk(args='{"colour":"blue"}', call_id="tc_2")
+    r = _run(_source([_tool_chunk(), _finish("tool_calls")], [again, _finish("tool_calls")]))
+    assert not r.passed and "repeated the same call" in r.reason
+
+
+def test_thinking_without_text_after_the_result_fails():
+    think = {"choices": [{"delta": {"reasoning_content": "The colour is recorded."}}]}
+    r = _run(_source([_tool_chunk(), _finish("tool_calls")], [think, _finish("stop")]))
+    assert not r.passed and "no text" in r.reason
+
+
 def test_an_upstream_error_is_a_result_not_a_crash():
     def broken(entry, body, settings):
         async def gen():

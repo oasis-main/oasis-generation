@@ -95,3 +95,77 @@ def test_vectors_carry_the_new_controls():
     bnames = {v["name"] for v in VEC["billing_vectors"]}
     assert {"paid_allowance_ref_empty_string", "paid_allowance_ref_null",
             "paid_allowance_ref_zero"} <= bnames
+
+
+# ---- ORG-170 P1: audience oasis-ws (CONTRACT section 9) --------------------------
+
+WSV = VEC["ws_token_vectors"]
+
+
+def _ws(v):
+    return ref.verify(v["token"], VEC["jwks"], v["now"], v["required_scope"],
+                      frozenset(v["revoked_jti"]), v["not_before_by_sub"],
+                      audience=v["audience"], session_id=v["session_id"])
+
+
+@pytest.mark.parametrize("v", WSV, ids=lambda v: v["name"])
+def test_ws_token_vector(v):
+    r = _ws(v)
+    assert r.reason == v["expect"]
+    assert r.ok == (v["expect"] == "ok")
+
+
+def test_ws_vectors_cover_the_new_reasons_and_both_outcomes():
+    reasons = {v["expect"] for v in WSV}
+    assert {"ok", "bad_aud", "bad_session", "missing_claim", "missing_scope", "malformed",
+            "revoked", "expired", "bad_signature", "bad_iss", "lifetime_too_long"} <= reasons
+    assert len(WSV) == 29 and len({v["name"] for v in WSV}) == 29
+
+
+def test_gateway_vectors_unchanged_by_the_ws_audience():
+    assert len(VEC["token_vectors"]) == 50 and len(VEC["billing_vectors"]) == 12
+
+
+def test_gateway_default_audience_is_still_oasis_gen_and_ws_does_not_leak_in():
+    tok = ref.sign(ref.base_header(), ref.ws_payload(), ref.TEST_SEED_A)
+    assert ref.verify(tok, VEC["jwks"], ref.NOW).reason == "bad_aud"   # ws token at the gateway
+    gen = ref.sign(ref.base_header(), ref.base_payload(ws=["sess_a"]), ref.TEST_SEED_A)
+    assert ref.verify(gen, VEC["jwks"], ref.NOW).ok                     # unchanged
+    assert ref.verify(gen, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id="sess_a").reason == "bad_aud"
+
+
+def test_ws_session_must_match_exactly_for_every_near_miss():
+    tok = ref.sign(ref.base_header(), ref.ws_payload(ws=["sess_a"]), ref.TEST_SEED_A)
+    for sid in ("sess_a", ):
+        assert ref.verify(tok, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id=sid).ok
+    for sid in ("sess_", "sess_a ", " sess_a", "sess_a\x00", "SESS_A", "sess_aa", "", "sess_b"):
+        r = ref.verify(tok, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id=sid)
+        assert r.reason == "bad_session", repr(sid)
+
+
+def test_scrambling_the_ws_claim_or_aud_is_rejected():
+    for over in ({"ws": ["sess_x"]}, {"ws": []}, {"ws": "sess_a"}, {"aud": "oasis-gen"}, {"aud": ["oasis-ws"]}):
+        tok = ref.sign(ref.base_header(), ref.ws_payload(**over), ref.TEST_SEED_A)
+        assert not ref.verify(tok, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id="sess_a").ok, over
+
+
+def test_flipping_any_byte_of_a_ws_token_is_rejected():
+    tok = ref.sign(ref.base_header(), ref.ws_payload(), ref.TEST_SEED_A)
+    assert ref.verify(tok, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id="sess_a").ok
+    for i in range(len(tok)):
+        if tok[i] == ".":
+            continue
+        flipped = tok[:i] + ("A" if tok[i] != "A" else "B") + tok[i + 1:]
+        assert not ref.verify(flipped, VEC["jwks"], ref.NOW, audience=ref.AUD_WS, session_id="sess_a").ok, i
+
+
+def test_tool_scope_table_matches_the_contract_text():
+    doc = (ROOT / "docs" / "capability-token" / "CONTRACT.md").read_text()
+    assert VEC["ws_tool_scope"] == ref.WS_TOOL_SCOPE
+    for tool, scope in ref.WS_TOOL_SCOPE.items():
+        assert scope in ref.KNOWN_SCOPES and f"`{tool}`" in doc
+    # every shell tool needs ws:shell, no fs tool does, and nothing defaults for an unknown tool
+    assert {t for t, s in ref.WS_TOOL_SCOPE.items() if s == "ws:shell"} == {
+        "shell_exec", "shell_start", "shell_read", "shell_stop"}
+    assert ref.scope_for_tool("fs_read") == "ws:fs" and ref.scope_for_tool("rm_rf") is None
+    assert ref.scope_for_tool("") is None and ref.scope_for_tool("FS_READ") is None

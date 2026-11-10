@@ -33,6 +33,23 @@ def test_token_vector(v):
         assert r.claims is None
 
 
+@pytest.mark.parametrize("v", VEC["ws_token_vectors"], ids=lambda v: v["name"])
+def test_ws_token_vector(v):
+    r = cap.verify(
+        v["token"], VEC["jwks"], v["now"], issuer=VEC["iss"], audience=v["audience"],
+        required_scope=v["required_scope"], revoked_jti=frozenset(v["revoked_jti"]),
+        not_before_by_sub=v["not_before_by_sub"], session_id=v["session_id"],
+    )
+    assert r.reason == v["expect"]
+    assert r.ok == (v["expect"] == "ok")
+
+
+def test_ws_token_is_refused_by_the_gateway_audience():
+    v = next(x for x in VEC["ws_token_vectors"] if x["name"] == "ws_valid")
+    r = cap.verify(v["token"], VEC["jwks"], v["now"], issuer=VEC["iss"], audience=cap.AUD_GEN)
+    assert r.reason == "bad_aud"
+
+
 @pytest.mark.parametrize("v", VEC["billing_vectors"], ids=lambda v: v["name"])
 def test_billing_vector(v):
     assert cap.check_inference_allowed(v["payload"]) == v["expect_status"]

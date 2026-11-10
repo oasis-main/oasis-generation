@@ -22,12 +22,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 ISS = "https://auth.dev.cloud.oasis-x.io"
 AUD = "oasis-gen"
+AUD_WS = "oasis-ws"  # ORG-170 P1: the workspace MCP server (CONTRACT section 9)
 TYP = "oasis-cap+jwt"
 MAX_LIFETIME_S = 900
 LEEWAY_S = 30
 TIERS = ("free", "personal", "pro", "max")
 BILLING = ("none", "active", "suspended")
 KNOWN_SCOPES = ("gen:chat", "gen:models", "gen:decide", "ws:session", "ws:fs", "ws:shell")
+# ORG-170 P1 (CONTRACT section 9): which scope each workspace MCP tool needs.
+WS_TOOL_SCOPE = {
+    "ws_info": "ws:session", "ws_stop": "ws:session",
+    "fs_list": "ws:fs", "fs_read": "ws:fs", "fs_write": "ws:fs", "fs_patch": "ws:fs",
+    "fs_search": "ws:fs", "fs_stat": "ws:fs", "fs_move": "ws:fs", "fs_delete": "ws:fs",
+    "shell_exec": "ws:shell", "shell_start": "ws:shell", "shell_read": "ws:shell",
+    "shell_stop": "ws:shell",
+}
 REQUIRED = ("iss", "aud", "sub", "tier", "billing_state", "scopes", "jti", "iat", "exp")
 
 TEST_SEED_A = bytes(range(32))
@@ -112,8 +121,13 @@ class Result:
 
 def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
            revoked_jti: frozenset[str] = frozenset(),
-           not_before_by_sub: dict[str, int] | None = None) -> Result:
+           not_before_by_sub: dict[str, int] | None = None,
+           audience: str = AUD, session_id: str | None = None) -> Result:
     """Return Result(ok, reason). Never raises on bad input.
+
+    audience: `oasis-gen` (default, the gateway) or `oasis-ws` (workspace MCP server,
+    CONTRACT section 9). For `oasis-ws` the `ws` claim is required and, when
+    session_id is given, must contain it exactly (else `bad_session`).
 
     not_before_by_sub: per-user revocation (CONTRACT section 6). A token whose
     `iat` is earlier than the value for its `sub` is refused as `revoked`.
@@ -154,7 +168,7 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
         return no("missing_claim")
     if payload["iss"] != ISS:
         return no("bad_iss")
-    if payload["aud"] != AUD:  # string only; list audiences are refused
+    if payload["aud"] != audience:  # string only; list audiences are refused
         return no("bad_aud")
     ints = (payload["iat"], payload["exp"])
     if not all(type(v) is int for v in ints):
@@ -182,14 +196,24 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
     ws = payload.get("ws")
     if "ws" in payload and not (isinstance(ws, list) and all(isinstance(w, str) for w in ws)):
         return no("malformed")
+    if audience == AUD_WS:
+        if "ws" not in payload or not payload["ws"]:
+            return no("missing_claim")  # a workspace token names its session(s)
     if payload["jti"] in revoked_jti:
         return no("revoked")
     nb = (not_before_by_sub or {}).get(payload["sub"])
     if nb is not None and iat < nb:
         return no("revoked")
+    if audience == AUD_WS and session_id is not None and session_id not in payload["ws"]:
+        return no("bad_session")
     if required_scope is not None and required_scope not in sc:
         return no("missing_scope")
     return Result(True, "ok")
+
+
+def scope_for_tool(tool: str) -> str | None:
+    """Scope a workspace MCP tool needs; None for an unknown tool (the server refuses it)."""
+    return WS_TOOL_SCOPE.get(tool)
 
 
 def check_inference_allowed(payload: dict) -> int:
@@ -229,6 +253,84 @@ def base_header(**over) -> dict:
     h = {"alg": "EdDSA", "typ": TYP, "kid": KID_A}
     h.update(over)
     return h
+
+
+def ws_payload(**over) -> dict:
+    d = dict(aud=AUD_WS, scopes=["ws:session", "ws:fs", "ws:shell"], ws=["sess_a"],
+             jti="jti-ws-0001")
+    d.update(over)
+    return base_payload(**d)
+
+
+def build_ws_vectors(jwks: dict) -> list[dict]:
+    """ORG-170 P1 vectors (CONTRACT section 9). Same shape as token_vectors plus
+    `audience` and `session_id`. Kept in a separate list so the 50 gateway vectors
+    stay unchanged."""
+    W: list[dict] = []
+
+    def add(name, token, expect, session="sess_a", scope=None, now=NOW, revoked=(),
+            not_before=None, note=""):
+        W.append({"name": name, "token": token, "now": now, "audience": AUD_WS,
+                  "session_id": session, "required_scope": scope,
+                  "revoked_jti": list(revoked), "not_before_by_sub": dict(not_before or {}),
+                  "expect": expect, "note": note})
+
+    ok = sign(base_header(), ws_payload(), TEST_SEED_A)
+    add("ws_valid", ok, "ok", scope="ws:fs")
+    add("ws_valid_shell_scope", ok, "ok", scope="ws:shell")
+    add("ws_valid_session_scope", ok, "ok", scope="ws:session")
+    add("ws_valid_no_scope_required", ok, "ok")
+    add("ws_valid_two_sessions_second_matches",
+        sign(base_header(), ws_payload(ws=["sess_a", "sess_b"]), TEST_SEED_A), "ok", session="sess_b")
+    add("ws_valid_session_not_checked_when_unset", ok, "ok", session=None,
+        note="a verifier that is not bound to a session may skip the match; the MCP server must always pass its SESSION_ID")
+    # audience separation, both ways
+    add("ws_gen_token_refused",
+        sign(base_header(), base_payload(scopes=["ws:fs"], ws=["sess_a"]), TEST_SEED_A), "bad_aud",
+        scope="ws:fs", note="a gateway token (aud oasis-gen) never opens a workspace")
+    add("ws_aud_as_list", sign(base_header(), ws_payload(aud=[AUD_WS]), TEST_SEED_A), "bad_aud")
+    add("ws_aud_prefix", sign(base_header(), ws_payload(aud="oasis-ws-extra"), TEST_SEED_A), "bad_aud")
+    # session binding
+    add("ws_wrong_session", ok, "bad_session", session="sess_other")
+    add("ws_session_prefix_is_not_a_match", ok, "bad_session", session="sess_")
+    add("ws_session_case_differs", ok, "bad_session", session="SESS_A")
+    add("ws_session_empty_string", ok, "bad_session", session="")
+    add("ws_missing_ws_claim",
+        sign(base_header(), {k: v for k, v in ws_payload().items() if k != "ws"}, TEST_SEED_A),
+        "missing_claim")
+    add("ws_empty_ws_list", sign(base_header(), ws_payload(ws=[]), TEST_SEED_A), "missing_claim")
+    add("ws_not_a_list", sign(base_header(), ws_payload(ws="sess_a"), TEST_SEED_A), "malformed")
+    add("ws_list_with_non_string", sign(base_header(), ws_payload(ws=["sess_a", 7]), TEST_SEED_A),
+        "malformed")
+    # scope table
+    add("ws_missing_fs_scope",
+        sign(base_header(), ws_payload(scopes=["ws:session", "ws:shell"]), TEST_SEED_A), "missing_scope",
+        scope="ws:fs")
+    add("ws_missing_shell_scope",
+        sign(base_header(), ws_payload(scopes=["ws:session", "ws:fs"]), TEST_SEED_A), "missing_scope",
+        scope="ws:shell")
+    add("ws_gen_scopes_do_not_grant_ws",
+        sign(base_header(), ws_payload(scopes=["gen:chat", "gen:models", "gen:decide"]), TEST_SEED_A),
+        "missing_scope", scope="ws:fs")
+    # the shared checks still apply under this audience
+    add("ws_expired", ok, "expired", now=NOW + 600 + LEEWAY_S, scope="ws:fs")
+    add("ws_lifetime_901", sign(base_header(), ws_payload(exp=NOW + 901), TEST_SEED_A),
+        "lifetime_too_long")
+    add("ws_signed_by_other_key", sign(base_header(), ws_payload(), TEST_SEED_B), "bad_signature")
+    add("ws_wrong_iss", sign(base_header(), ws_payload(iss="https://evil.example"), TEST_SEED_A),
+        "bad_iss")
+    add("ws_revoked_jti", ok, "revoked", revoked=["jti-ws-0001"])
+    add("ws_revoked_by_sub_not_before", ok, "revoked", not_before={"user_test_001": NOW + 1})
+    add("ws_revoked_wins_over_wrong_session", ok, "revoked", session="sess_other",
+        revoked=["jti-ws-0001"], note="check order: revocation, then session, then scope")
+    add("ws_wrong_session_wins_over_missing_scope",
+        sign(base_header(), ws_payload(scopes=["ws:session"]), TEST_SEED_A), "bad_session",
+        session="sess_other", scope="ws:fs")
+    hp = ok.split(".")
+    evil = b64u(_json(ws_payload(ws=["sess_victim"])))
+    add("ws_payload_swapped_keep_sig", f"{hp[0]}.{evil}.{hp[2]}", "bad_signature",
+        session="sess_victim", note="a user cannot retarget a token at another user's session")
+    return W
 
 
 def build_vectors() -> dict:
@@ -341,6 +443,7 @@ def build_vectors() -> dict:
         B.append({"name": f"paid_allowance_ref_{nm}", "payload": base_payload(allowance_ref=val),
                   "expect_status": 402})
 
+    W = build_ws_vectors(jwks)
     return {
         "contract": "oasis-capability-token/1",
         "warning": "TEST KEY ONLY. The seed is public. Never trust this JWKS anywhere but tests.",
@@ -348,6 +451,7 @@ def build_vectors() -> dict:
         "max_lifetime_s": MAX_LIFETIME_S,
         "test_seed_a_hex": TEST_SEED_A.hex(),
         "jwks": jwks, "token_vectors": V, "billing_vectors": B,
+        "ws_aud": AUD_WS, "ws_tool_scope": WS_TOOL_SCOPE, "ws_token_vectors": W,
     }
 
 

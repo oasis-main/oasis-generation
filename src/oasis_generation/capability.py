@@ -36,6 +36,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 logger = logging.getLogger(__name__)
 
+AUD_WS = "oasis-ws"  # workspace MCP server (CONTRACT section 9, ORG-170 P1)
 AUD_GEN = "oasis-gen"
 TYP = "oasis-cap+jwt"
 MAX_LIFETIME_S = 900
@@ -115,11 +116,14 @@ def verify(
     required_scope: str | None = None,
     revoked_jti: frozenset[str] | set[str] = frozenset(),
     not_before_by_sub: dict[str, int] | None = None,
+    session_id: str | None = None,
 ) -> Result:
     """Return Result(ok, reason, claims). Never raises on bad input.
 
     Check order (fixed by the contract): structure, alg, typ, key, signature,
-    claims, revocation (jti, then per-sub not-before), scope.
+    claims, revocation (jti, then per-sub not-before), (oasis-ws only) session, scope.
+    For audience `oasis-ws`, `ws` is required and non-empty (`missing_claim`) and
+    session_id, when given, must be an exact member of `ws` (`bad_session`).
     """
     def no(r: str) -> Result:
         return Result(False, r, None)
@@ -187,11 +191,15 @@ def verify(
         ws = payload["ws"]
         if not (isinstance(ws, list) and all(isinstance(w, str) for w in ws)):
             return no("malformed")
+    if audience == AUD_WS and not payload.get("ws"):
+        return no("missing_claim")
     if payload["jti"] in revoked_jti:
         return no("revoked")
     nb = (not_before_by_sub or {}).get(payload["sub"])
     if nb is not None and iat < nb:
         return no("revoked")
+    if audience == AUD_WS and session_id is not None and session_id not in payload["ws"]:
+        return no("bad_session")
     if required_scope is not None and required_scope not in sc:
         return no("missing_scope")
     return Result(True, "ok", payload)

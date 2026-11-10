@@ -123,7 +123,8 @@ def verify(
     Check order (fixed by the contract): structure, alg, typ, key, signature,
     claims, revocation (jti, then per-sub not-before), (oasis-ws only) session, scope.
     For audience `oasis-ws`, `ws` is required and non-empty (`missing_claim`) and
-    session_id, when given, must be an exact member of `ws` (`bad_session`).
+    session_id must be an exact member of `ws` (`bad_session`); a call without
+    session_id is refused as `bad_session` too (fail closed).
     """
     def no(r: str) -> Result:
         return Result(False, r, None)
@@ -198,8 +199,8 @@ def verify(
     nb = (not_before_by_sub or {}).get(payload["sub"])
     if nb is not None and iat < nb:
         return no("revoked")
-    if audience == AUD_WS and session_id is not None and session_id not in payload["ws"]:
-        return no("bad_session")
+    if audience == AUD_WS and (session_id is None or session_id not in payload["ws"]):
+        return no("bad_session")  # fail closed: an oasis-ws check always names its session
     if required_scope is not None and required_scope not in sc:
         return no("missing_scope")
     return Result(True, "ok", payload)

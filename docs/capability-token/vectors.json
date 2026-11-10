@@ -823,10 +823,10 @@
   },
   {
    "audience": "oasis-ws",
-   "expect": "ok",
-   "name": "ws_valid_session_not_checked_when_unset",
+   "expect": "bad_session",
+   "name": "ws_session_id_not_given",
    "not_before_by_sub": {},
-   "note": "a verifier that is not bound to a session may skip the match; the MCP server must always pass its SESSION_ID",
+   "note": "fail closed: a verify call for oasis-ws without a session id refuses even a valid token",
    "now": 1800000000,
    "required_scope": null,
    "revoked_jti": [],

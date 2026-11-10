@@ -104,7 +104,7 @@ sections 1-6. What differs:
 |---|---|---|
 | `aud` | `oasis-gen` | `oasis-ws` (a gateway token never opens a workspace, and the reverse) |
 | `ws` claim | optional | **required, non-empty list of session ids**. Missing or empty is `missing_claim`; wrong type is `malformed`. |
-| session binding | none | the MCP server passes its own `SESSION_ID`; the token's `ws` must contain it **exactly** (no prefix, no case folding, no empty id), else `bad_session` |
+| session binding | none | the MCP server passes its own `SESSION_ID`; the token's `ws` must contain it **exactly** (no prefix, no case folding, no empty id), else `bad_session`. A verify call without a session id is also `bad_session` (fail closed). |
 | billing / tier | section 5 | not decided by the verifier. The manager refuses to create a session for a free tier (ORG-172); the token only proves identity, audience, session and scope. |
 
 Scope per MCP tool (a tool not in this table is refused by the server, never defaulted):
@@ -122,7 +122,7 @@ holds the broker connection and stops the task on revocation of the session's `s
 billing (plan F3, accepted): compute is billed from ECS `startedAt`/`stoppedAt`.
 
 The 29 `ws_token_vectors` in `vectors.json` cover: audience separation both ways, list and
-prefixed audiences, session match / mismatch / prefix / case / empty, missing, empty and
+prefixed audiences, session match / mismatch / prefix / case / empty / not given, missing, empty and
 ill-typed `ws`, scope table gaps (including gateway scopes not granting `ws:*`), the shared
 checks under this audience, and check order (revocation before session before scope).
 A payload swapped after signing to target another session is `bad_signature`.

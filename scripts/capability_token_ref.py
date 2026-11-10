@@ -126,8 +126,8 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
     """Return Result(ok, reason). Never raises on bad input.
 
     audience: `oasis-gen` (default, the gateway) or `oasis-ws` (workspace MCP server,
-    CONTRACT section 9). For `oasis-ws` the `ws` claim is required and, when
-    session_id is given, must contain it exactly (else `bad_session`).
+    CONTRACT section 9). For `oasis-ws` the `ws` claim is required and must contain
+    session_id exactly; a call without session_id is refused too (`bad_session`).
 
     not_before_by_sub: per-user revocation (CONTRACT section 6). A token whose
     `iat` is earlier than the value for its `sub` is refused as `revoked`.
@@ -204,8 +204,8 @@ def verify(token: str, jwks: dict, now: int, required_scope: str | None = None,
     nb = (not_before_by_sub or {}).get(payload["sub"])
     if nb is not None and iat < nb:
         return no("revoked")
-    if audience == AUD_WS and session_id is not None and session_id not in payload["ws"]:
-        return no("bad_session")
+    if audience == AUD_WS and (session_id is None or session_id not in payload["ws"]):
+        return no("bad_session")  # fail closed: an oasis-ws check always names its session
     if required_scope is not None and required_scope not in sc:
         return no("missing_scope")
     return Result(True, "ok")
@@ -282,8 +282,8 @@ def build_ws_vectors(jwks: dict) -> list[dict]:
     add("ws_valid_no_scope_required", ok, "ok")
     add("ws_valid_two_sessions_second_matches",
         sign(base_header(), ws_payload(ws=["sess_a", "sess_b"]), TEST_SEED_A), "ok", session="sess_b")
-    add("ws_valid_session_not_checked_when_unset", ok, "ok", session=None,
-        note="a verifier that is not bound to a session may skip the match; the MCP server must always pass its SESSION_ID")
+    add("ws_session_id_not_given", ok, "bad_session", session=None,
+        note="fail closed: a verify call for oasis-ws without a session id refuses even a valid token")
     # audience separation, both ways
     add("ws_gen_token_refused",
         sign(base_header(), base_payload(scopes=["ws:fs"], ws=["sess_a"]), TEST_SEED_A), "bad_aud",

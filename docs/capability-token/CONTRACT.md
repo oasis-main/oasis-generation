@@ -7,7 +7,7 @@ form of this page is `scripts/capability_token_ref.py`; the shared test data is
 Step 2 (`oasis-cloud src/shared/capability_token.py`), step 3 (oasis-auth issuer) and
 the gateway (step 5) must each reproduce every vector's decision and reason code.
 
-Decided by Mike/console 2026-10-23: Ed25519 (EdDSA), JWKS endpoint in oasis-auth,
+Decided 2026-10-23: Ed25519 (EdDSA), JWKS endpoint in oasis-auth,
 lifetime <= 15 min, local verification with a cached JWKS, revocation on
 `oasis/system/auth/revocation`.
 
@@ -47,7 +47,7 @@ Clock leeway: 30 s (expired only when `now >= exp + 30`; not yet valid when `iat
 
 `GET <iss>/.well-known/jwks.json` returns OKP / Ed25519 keys with `kid`. Verifiers
 cache the set (TTL 10 min) and refetch once, rate-limited, on an unknown `kid`. The
-private key lives in a KMS or Secrets Manager entry owned by Yes Man's Terraform; no
+private key lives in a KMS or Secrets Manager entry owned by the infrastructure Terraform; no
 code in this repo reads it. Rotation: publish the new key in the JWKS first, sign with
 it a full token lifetime later, remove the old key a full lifetime after that.
 
@@ -86,9 +86,15 @@ right after the `jti` check. Steps 2 and the gateway must implement exactly this
 Refresh flow (oasis-auth issues a new token from the Firebase session), Stripe,
 price table, usage events (step 6). Workspace (MCP) tokens are section 9.
 
+## 8. Known limits
+
+- A test seed is committed on purpose. The JWKS in `vectors.json` is never a trust root.
+- Vectors prove the reference verifier and the decision table agree with this text.
+  They do not prove the issuer signs correct claims; step 3 needs its own tests.
+
 ## 9. Workspace tokens, audience `oasis-ws` (ORG-170 P1, step 1)
 
-Decided by Mike 2026-11-05 (console m_4dd3f9d3): oasis-auth mints the workspace token
+Decided 2026-11-05: oasis-auth mints the workspace token
 (`POST /capability/token` with the `oasis-ws` audience and a session id); the workspace
 manager does not hold the signing key; in P1 the token stays on the server side and never
 reaches the browser. Same format, keys, lifetime (<= 900 s), leeway and revocation as
@@ -113,16 +119,10 @@ The server verifies on **every** request, not once per connection (tokens live <
 revocation is by `jti` and per-`sub` not-before). It subscribes to nothing: the manager
 holds the broker connection and stops the task on revocation of the session's `sub`
 (plan F4). The in-box audit lines (command hash, exit code) are advisory and never used for
-billing (plan F3, accepted by Mike): compute is billed from ECS `startedAt`/`stoppedAt`.
+billing (plan F3, accepted): compute is billed from ECS `startedAt`/`stoppedAt`.
 
 The 29 `ws_token_vectors` in `vectors.json` cover: audience separation both ways, list and
 prefixed audiences, session match / mismatch / prefix / case / empty, missing, empty and
 ill-typed `ws`, scope table gaps (including gateway scopes not granting `ws:*`), the shared
 checks under this audience, and check order (revocation before session before scope).
 A payload swapped after signing to target another session is `bad_signature`.
-
-## 8. Known limits
-
-- A test seed is committed on purpose. The JWKS in `vectors.json` is never a trust root.
-- Vectors prove the reference verifier and the decision table agree with this text.
-  They do not prove the issuer signs correct claims; step 3 needs its own tests.

@@ -11,7 +11,8 @@ Pieces:
   - JwksCache                 the oasis-auth JWKS, TTL 600 s, one rate-limited
                               refetch on an unknown kid, last good set kept on error.
   - AuthState                 revoked jti set, per-sub not-before, and the
-                              blocked-sub set from the billing topic.
+                              blocked-sub set from the billing topic, plus the
+                              periodic full snapshot that repairs all three.
 
 The package never imports from the repository's reference script; the logic is
 copied on purpose so the image does not ship test tooling.
@@ -55,6 +56,23 @@ JWKS_MAX_BYTES = 64 * 1024
 # issued at most LEEWAY_S after the event lives at most MAX_LIFETIME_S, and is
 # accepted LEEWAY_S after exp (CONTRACT section 6).
 REVOCATION_HOLD_S = MAX_LIFETIME_S + 2 * LEEWAY_S
+
+# ---- state snapshot (ORG-171 backstop A) ----
+# A snapshot whose ts is this far ahead of our clock is refused: its ts would
+# pin the per-sub ordering in the future and make every later event "older".
+SNAPSHOT_FUTURE_S = 60
+# A snapshot older than this is ignored (a replay or a stuck queue), and does not
+# count as fresh state.
+SNAPSHOT_MAX_AGE_S = 300
+# A locally blocked sub is dropped as "healed" only when its deciding event is
+# older than the snapshot by more than this. Auth publishes the billing event
+# first and stores the signal after, so a snapshot read in between can miss a
+# sub we already (rightly) blocked.
+SNAPSHOT_HEAL_GRACE_S = 10
+SNAPSHOT_MAX_LIST = 20_000
+SNAPSHOT_MAX_PARTS = 100
+SNAPSHOT_PENDING_MAX = 8
+SNAPSHOT_PENDING_TTL_S = 120
 
 
 # ---- strict encoding (CONTRACT section 1) -------------------------------------
@@ -336,6 +354,10 @@ class AuthState:
         self._nb: dict[str, tuple[int, float]] = {}    # sub -> (not_before, drop time)
         self._blocked: dict[str, float] = {}           # sub -> ts of the deciding event
         self._billing_ts: dict[str, float] = {}
+        # Snapshot bookkeeping (backstop A).
+        self._snapshot_ts: float | None = None         # ts of the newest snapshot applied
+        self._snapshot_at: float | None = None         # our clock when it was applied
+        self._pending: dict[str, dict] = {}            # event_id -> parts of a split snapshot
 
     def _prune(self, now: float) -> None:
         for j in [j for j, t in self._jti.items() if t <= now]:
@@ -384,6 +406,145 @@ class AuthState:
             else:
                 self._blocked.pop(sub, None)
         return True
+
+    # ---- full snapshot (oasis/system/auth/billing/snapshot) ----
+
+    @staticmethod
+    def _parse_snapshot(ev) -> dict | None:
+        """Validate one snapshot message. None = refuse the whole message, so a
+        malformed snapshot never changes any state."""
+        if not isinstance(ev, dict):
+            return None
+        event_id = ev.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        ts = _parse_ts(ev.get("ts"))
+        if ts is None:
+            return None
+        part, of = ev.get("part"), ev.get("of")
+        if part is None and of is None:
+            part = of = 1
+        elif type(part) is not int or type(of) is not int or not 1 <= part <= of <= SNAPSHOT_MAX_PARTS:
+            return None
+        lists = []
+        for key in ("blocked", "revoked_subs", "revoked_jti"):
+            items = ev.get(key, [])
+            if not isinstance(items, list) or len(items) > SNAPSHOT_MAX_LIST:
+                return None
+            lists.append(items)
+        blocked: dict[str, float] = {}
+        for e in lists[0]:
+            if not isinstance(e, dict) or not isinstance(e.get("sub"), str) or not e["sub"]:
+                return None
+            ets = ts
+            if e.get("ts") is not None:
+                ets = _parse_ts(e["ts"])
+                if ets is None or ets > ts:
+                    return None
+            blocked[e["sub"]] = max(ets, blocked.get(e["sub"], ets))
+        rsubs: dict[str, int] = {}
+        for e in lists[1]:
+            if (not isinstance(e, dict) or not isinstance(e.get("sub"), str) or not e["sub"]
+                    or type(e.get("not_before")) is not int):
+                return None  # not_before is required: a receive-time default would move on every snapshot
+            rsubs[e["sub"]] = max(e["not_before"], rsubs.get(e["sub"], e["not_before"]))
+        rjti: set[str] = set()
+        for e in lists[2]:
+            if not isinstance(e, dict) or not isinstance(e.get("jti"), str) or not e["jti"]:
+                return None
+            rjti.add(e["jti"])
+        return {"event_id": event_id, "ts": ts, "part": part, "of": of,
+                "blocked": blocked, "revoked_subs": rsubs, "revoked_jti": rjti}
+
+    def apply_snapshot(self, ev) -> bool:
+        """Apply the full billing and revocation state from auth.
+
+        Returns False for a malformed message (state untouched), True otherwise,
+        including when the snapshot is old, a replay, or a part of a split
+        snapshot that is not complete yet. State only becomes "ready" when a
+        complete, fresh snapshot has been applied.
+
+        - Listed blocked subs are added with the same per-sub ordering rule as
+          apply_billing (an entry older than the event we hold is ignored).
+        - A locally blocked sub that is NOT listed is dropped when its deciding
+          event is older than the snapshot (heals a missed "ok").
+        - Revocations are merged, never removed (they expire by hold time).
+        """
+        snap = self._parse_snapshot(ev)
+        if snap is None:
+            return False
+        now = self._clock()
+        if snap["ts"] > now + SNAPSHOT_FUTURE_S:
+            return False
+        if snap["ts"] < now - SNAPSHOT_MAX_AGE_S:
+            logger.warning("ignoring an old state snapshot (%.0f s old)", now - snap["ts"])
+            return True
+        with self._lock:
+            if self._snapshot_ts is not None and snap["ts"] < self._snapshot_ts:
+                return True  # older than the snapshot we already applied
+            if snap["of"] > 1:
+                for k in [k for k, p in self._pending.items() if now - p["t"] > SNAPSHOT_PENDING_TTL_S]:
+                    del self._pending[k]
+                pend = self._pending.get(snap["event_id"])
+                if pend is not None and (pend["of"] != snap["of"] or pend["ts"] != snap["ts"]):
+                    del self._pending[snap["event_id"]]
+                    return False
+                if pend is None:
+                    while len(self._pending) >= SNAPSHOT_PENDING_MAX:
+                        del self._pending[min(self._pending, key=lambda k: self._pending[k]["t"])]
+                    pend = self._pending[snap["event_id"]] = {
+                        "of": snap["of"], "ts": snap["ts"], "t": now, "parts": {}}
+                pend["parts"][snap["part"]] = snap
+                if len(pend["parts"]) < pend["of"]:
+                    return True
+                del self._pending[snap["event_id"]]
+                merged = {"ts": snap["ts"], "blocked": {}, "revoked_subs": {}, "revoked_jti": set()}
+                for p in pend["parts"].values():
+                    for sub, t in p["blocked"].items():
+                        merged["blocked"][sub] = max(t, merged["blocked"].get(sub, t))
+                    for sub, nb in p["revoked_subs"].items():
+                        merged["revoked_subs"][sub] = max(nb, merged["revoked_subs"].get(sub, nb))
+                    merged["revoked_jti"] |= p["revoked_jti"]
+                snap = merged
+            self._apply_full(snap, now)
+        return True
+
+    def _apply_full(self, snap: dict, now: float) -> None:
+        ts = snap["ts"]
+        for sub, ets in snap["blocked"].items():
+            last = self._billing_ts.get(sub)
+            if last is not None and ets < last:
+                continue  # we hold a newer decision for this sub
+            self._billing_ts[sub] = ets
+            self._blocked[sub] = ets
+        for sub in [s for s in self._blocked if s not in snap["blocked"]]:
+            decided = self._billing_ts.get(sub, self._blocked[sub])
+            if decided < ts - SNAPSHOT_HEAL_GRACE_S:
+                del self._blocked[sub]
+                self._billing_ts[sub] = ts
+                logger.warning("state snapshot healed a missed 'ok' for a blocked sub")
+        for sub, nb in snap["revoked_subs"].items():
+            prev = self._nb.get(sub)
+            if prev is None or nb > prev[0]:
+                self._nb[sub] = (nb, max(nb, now) + REVOCATION_HOLD_S)
+        for jti in snap["revoked_jti"]:
+            self._jti.setdefault(jti, now + REVOCATION_HOLD_S)
+        self._snapshot_ts = max(ts, self._snapshot_ts or ts)
+        self._snapshot_at = now
+
+    @property
+    def state_ready(self) -> bool:
+        with self._lock:
+            return self._snapshot_at is not None
+
+    def state_age_s(self) -> float | None:
+        """Seconds since the last applied snapshot; None before the first."""
+        with self._lock:
+            return None if self._snapshot_at is None else max(0.0, self._clock() - self._snapshot_at)
+
+    def blocked_count(self) -> int:
+        with self._lock:
+            return len(self._blocked)
 
     def revoked_jti(self) -> frozenset[str]:
         with self._lock:

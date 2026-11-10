@@ -106,6 +106,16 @@ class Settings(BaseSettings):
     usage_spool_dir: str = _env("USAGE_SPOOL_DIR", "/tmp/oasis-generation/usage-spool")
     usage_spool_max: int = _env("USAGE_SPOOL_MAX", 1000)
 
+    # ── ORG-171 backstop A: warm-up of the revocation / spend-cap state ──
+    # Metered capability routes answer 503 state_unavailable until auth's first
+    # state snapshot has been applied. After STATE_WARMUP_S seconds the gateway
+    # serves anyway ONLY when STATE_WARMUP_FAIL_OPEN is true (dev). Prod: false.
+    state_warmup_fail_open: bool = _env("STATE_WARMUP_FAIL_OPEN", False)
+    state_warmup_s: int = _env("STATE_WARMUP_S", 120)
+    # No snapshot for this long after being ready: /health shows the age and the
+    # gateway logs an error. It keeps serving (tokens expire within 15 minutes).
+    state_stale_s: int = _env("STATE_STALE_S", 300)
+
     model_config = {"env_prefix": "OASIS_GENERATION_", "populate_by_name": True}
 
     @property

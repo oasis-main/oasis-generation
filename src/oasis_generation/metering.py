@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 USAGE_TOPIC = "oasis/system/gen/usage/output"
 REVOCATION_TOPIC = "oasis/system/auth/revocation/output"
 BILLING_TOPIC = "oasis/system/auth/billing/output"
+SNAPSHOT_TOPIC = "oasis/system/auth/billing/snapshot"
 SPOOL_FILE = "usage-spool.jsonl"
 SPOOL_MAX_AGE_S = 600
 DEFAULT_SPOOL_MAX = 1000
@@ -242,7 +243,7 @@ def _default_client_factory(client_id: str):
 
 
 class MqttBridge:
-    """One paho connection: publish usage, subscribe to revocation and billing.
+    """One paho connection: publish usage, subscribe to revocation, billing and the state snapshot.
 
     Connects in the background (connect_async + loop_start), so the gateway
     starts and serves even when the broker is down; usage events then go to the
@@ -291,7 +292,8 @@ class MqttBridge:
         # Plain (not shared) subscriptions: every gateway task needs every event.
         client.subscribe(REVOCATION_TOPIC, qos=1)
         client.subscribe(BILLING_TOPIC, qos=1)
-        logger.info("MQ bridge connected; subscribed to revocation and billing topics")
+        client.subscribe(SNAPSHOT_TOPIC, qos=1)
+        logger.info("MQ bridge connected; subscribed to revocation, billing and snapshot topics")
 
     def _on_disconnect(self, client, userdata, flags, reason_code=None, properties=None):
         self.connected = False
@@ -307,6 +309,8 @@ class MqttBridge:
             ok = self.state.apply_revocation(ev)
         elif msg.topic == BILLING_TOPIC:
             ok = self.state.apply_billing(ev)
+        elif msg.topic == SNAPSHOT_TOPIC:
+            ok = self.state.apply_snapshot(ev)
         else:
             return
         if not ok:

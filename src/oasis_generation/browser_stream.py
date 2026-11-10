@@ -86,6 +86,15 @@ class CapabilityRuntime:
         self.meter = UsageMeter(publisher, settings.usage_spool_dir, settings.usage_spool_max,
                                 clock=clock)
         self.bridge: MqttBridge | None = None
+        # Backstop A: once the gateway runs for real (start_bridge), metered
+        # routes wait for auth's first state snapshot. A bare runtime (tests,
+        # tools) does not require one.
+        self.state_required = False
+        self.warmup_fail_open = settings.state_warmup_fail_open
+        self.warmup_s = settings.state_warmup_s
+        self.state_stale_s = settings.state_stale_s
+        self.started_at = clock()
+        self._state_warned: set[str] = set()
         self.stale_after_s = settings.upstream_timeout_s + 60
         self._inflight: dict[tuple[str, str], float] = {}
 
@@ -104,7 +113,46 @@ class CapabilityRuntime:
     def release(self, sub: str, crid: str) -> None:
         self._inflight.pop((sub, crid), None)
 
+    def state_available(self) -> bool:
+        """May a metered route serve? False while waiting for the first snapshot."""
+        if not self.state_required or self.state.state_ready:
+            return True
+        return self.warmup_fail_open and self.clock() - self.started_at >= self.warmup_s
+
+    def watch_state(self) -> None:
+        """Log (once per episode) a warm-up that ran out and a stale snapshot."""
+        if not self.state_required:
+            return
+        warned = self._state_warned
+        if not self.state.state_ready:
+            if self.clock() - self.started_at >= self.warmup_s and "warmup" not in warned:
+                warned.add("warmup")
+                logger.error("no state snapshot from auth after %d s; metered routes %s", self.warmup_s,
+                             "serve anyway (STATE_WARMUP_FAIL_OPEN=true)" if self.warmup_fail_open
+                             else "answer 503 state_unavailable")
+            return
+        warned.discard("warmup")
+        age = self.state.state_age_s()
+        if age is not None and age > self.state_stale_s:
+            if "stale" not in warned:
+                warned.add("stale")
+                logger.error("state snapshot is %.0f s old (limit %d s); still serving", age, self.state_stale_s)
+        else:
+            warned.discard("stale")
+
+    def health(self) -> dict:
+        age = self.state.state_age_s()
+        return {
+            "state_ready": self.state.state_ready,
+            "state_age_s": None if age is None else round(age, 1),
+            "blocked_count": self.state.blocked_count(),
+            "spool_count": self.meter.spool_count(),
+            "metering_available": self.meter.available(),
+        }
+
     def start_bridge(self, settings: Settings) -> None:
+        self.state_required = True
+        self.started_at = self.clock()
         if not settings.mqtt_host:
             logger.warning("capability auth is on but MQTT_HOST is empty: usage events are "
                            "spooled only, and metered requests get 503 after 10 minutes")

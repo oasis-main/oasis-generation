@@ -95,6 +95,10 @@ async def _flush_spool_forever(rt, interval_s: float = 5.0) -> None:
     while True:
         await asyncio.sleep(interval_s)
         try:
+            rt.watch_state()
+        except Exception:  # noqa: BLE001 - monitoring must not stop the flusher
+            logger.exception("state watch failed")
+        try:
             sent = await asyncio.to_thread(rt.meter.flush)
             if sent:
                 logger.info("usage spool: resent %d event(s)", sent)
@@ -219,7 +223,13 @@ def _record_usage_raw(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "oasis-generation"}
+    # Always 200: the target-group check must stay cheap and must not flap when
+    # auth is down. The state fields are for the monitor (backstop A).
+    out = {"status": "ok", "service": "oasis-generation"}
+    rt = browser_stream._runtime
+    if rt is not None:
+        out.update(rt.health())
+    return out
 
 
 @app.get("/v1/models")
@@ -699,6 +709,9 @@ async def chat_stream(request: Request, settings: Settings = Depends(get_setting
     if decision == 402:
         raise ApiError(402, "payment_required", "add a card to use AI",
                        extra={"tier": claims.get("tier"), "billing_state": claims.get("billing_state")})
+    if not rt.state_available():
+        raise ApiError(503, "state_unavailable", "waiting for the account state from auth; retry shortly",
+                       headers={"Retry-After": "5"})
     if rt.state.is_blocked(claims["sub"]):
         raise ApiError(429, "spend_cap_reached", "the monthly spend cap is reached",
                        headers={"Retry-After": str(browser_stream.seconds_to_next_month(rt.clock()))})

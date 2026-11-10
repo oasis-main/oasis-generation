@@ -211,6 +211,7 @@ def test_bridge_logs_in_as_service_and_subscribes_on_connect():
     assert b.connected
     assert ("oasis/system/auth/revocation/output", 1) in fake.subs
     assert ("oasis/system/auth/billing/output", 1) in fake.subs
+    assert ("oasis/system/auth/billing/snapshot", 1) in fake.subs
 
 
 def test_bridge_publish_false_when_not_connected():
@@ -256,3 +257,17 @@ def test_check_writable(tmp_path):
     bad = m.UsageMeter(None, str(blocker / "spool"))
     assert bad.check_writable() is False
     assert not bad.available()
+
+
+def test_bridge_routes_snapshot_to_state_and_refuses_a_bad_one(caplog):
+    import datetime as dt
+    b, fake, state = _bridge()
+    b.start()
+    ts = dt.datetime.now(dt.timezone.utc).isoformat()
+    good = {"event_id": "s1", "ts": ts, "blocked": [{"sub": "u7"}]}
+    fake.on_message(fake, None, FakeMsg("oasis/system/auth/billing/snapshot", json.dumps(good).encode()))
+    assert state.state_ready and state.is_blocked("u7")
+    with caplog.at_level("WARNING"):
+        fake.on_message(fake, None, FakeMsg("oasis/system/auth/billing/snapshot", b'{"event_id": "s2"}'))
+    assert any("refused a bad event" in r.message for r in caplog.records)
+    assert state.is_blocked("u7")

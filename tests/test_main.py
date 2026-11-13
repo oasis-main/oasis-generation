@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from oasis_generation import bedrock, mantle
 from oasis_generation.config import get_settings
 from oasis_generation.main import app
 
@@ -20,10 +21,66 @@ def test_models_lists_only_enabled():
     resp = client.get("/v1/models")
     assert resp.status_code == 200
     ids = [m["id"] for m in resp.json()["data"]]
-    assert "gemma-4-12b-it" in ids
-    # Community fine-tunes stay hidden until GEN-002 clears them.
-    assert "gemma-4-12b-coder" not in ids
-    assert "gemma-4-12b-agentic" not in ids
+    # GEN-002 pass 2026-07-12 cleared both community fine-tunes for
+    # personal/fleet use; baseline is disabled until re-pulled or cloud-hosted.
+    assert "gemma-4-12b-coder" in ids
+    assert "gemma-4-12b-agentic" in ids
+    assert "gemma-4-12b-it" not in ids
+    # Self-hosted higher tiers stay hidden until their runners exist...
+    assert "glm-5.2" not in ids
+    # ...but the Bedrock passthrough (GEN-003) is live now (roster trimmed 2026-07-24).
+    assert "claude-opus-4-8" in ids
+    assert "claude-sonnet-5" in ids
+    assert "glm-5" in ids
+    # Roster trim: these were removed 2026-07-24 and stay gone.
+    for removed in ("gpt-oss-120b", "deepseek-v3.2", "llama-4-maverick"):
+        assert removed not in ids
+    # claude-sonnet-4-6 and claude-haiku-4-5 came back with the cheaper tier
+    # (47fc573, 2026-08-30) and are served from Bedrock (ADM-053).
+    assert "claude-sonnet-4-6" in ids
+    assert "claude-haiku-4-5" in ids
+    # GPT-5.6-sol is live via the bedrock_mantle (Responses) backend.
+    assert "gpt-5.6-sol" in ids
+    # The openai_compat template stays disabled until a key is provided.
+    assert "gpt-5" not in ids
+
+
+def test_models_expose_capability_descriptors():
+    data = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    # Adaptive Claude: thinking + effort controllable, temperature hidden.
+    opus = data["claude-opus-4-8"]["capabilities"]
+    assert opus["supports_thinking"] is True
+    assert opus["supports_effort"] is True
+    assert opus["effort_levels"] == ["low", "high", "xhigh"]  # fast/balanced/deep order
+    assert opus["supports_temperature"] is False
+    assert opus["max_output_tokens_ceiling"] == 32000
+    assert opus["profiles"] == ["fast", "balanced", "deep"]
+    assert opus["default_profile"] == "balanced"
+    # Native model (GLM-5): no gateway thinking control, temperature allowed.
+    glm = data["glm-5"]["capabilities"]
+    assert glm["supports_thinking"] is False
+    assert glm["supports_effort"] is False
+    assert glm["supports_temperature"] is True
+    assert glm["effort_levels"] == []
+    # Local Gemma: native, small ceiling.
+    gemma = data["gemma-4-12b-coder"]["capabilities"]
+    assert gemma["supports_thinking"] is False
+    assert gemma["max_output_tokens_ceiling"] == 8192
+
+
+def test_models_expose_supports_client_tools():
+    data = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
+    # Every model says whether the browser may send it client tools.
+    assert all(isinstance(m["capabilities"]["supports_client_tools"], bool) for m in data.values())
+    # Only models that passed scripts/probe_client_tools.py carry True.
+    from oasis_generation.catalog import resolve
+    for mid, m in data.items():
+        assert m["capabilities"]["supports_client_tools"] is resolve(mid).client_tools
+    # Probe run of 2026-11-07: Bedrock Claude passes; Llama 3.3 on Bedrock has no
+    # tool use in streaming mode; the runner models are not probed yet.
+    assert data["claude-haiku-5-5"]["capabilities"]["supports_client_tools"] is True
+    assert data["llama3-3-70b"]["capabilities"]["supports_client_tools"] is False
+    assert data["gemma-4-12b-coder"]["capabilities"]["supports_client_tools"] is False
 
 
 def test_unknown_model_404s():
@@ -37,3 +94,75 @@ def test_auth_enforced_when_tokens_configured(monkeypatch):
     assert client.get("/v1/models").status_code == 401
     ok = client.get("/v1/models", headers={"Authorization": "Bearer sekrit"})
     assert ok.status_code == 200
+
+
+class _FakeBedrockClient:
+    def converse(self, **kwargs):
+        self.seen = kwargs
+        return {
+            "output": {"message": {"role": "assistant", "content": [{"text": "pong"}]}},
+            "stopReason": "end_turn",
+            "usage": {"inputTokens": 4, "outputTokens": 1, "totalTokens": 5},
+        }
+
+
+def test_bedrock_route_returns_openai_shape(monkeypatch):
+    fake = _FakeBedrockClient()
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["model"] == "claude-sonnet-5"
+    assert data["choices"][0]["message"]["content"] == "pong"
+    # The public id was translated to the Bedrock inference-profile id upstream.
+    assert fake.seen["modelId"] == "us.anthropic.claude-sonnet-5"
+    # The model's inference policy was applied: adaptive thinking + balanced
+    # effort injected, and no temperature leaked into inferenceConfig.
+    amrf = fake.seen.get("additionalModelRequestFields") or {}
+    assert amrf.get("thinking") == {"type": "adaptive", "display": "summarized"}
+    assert amrf.get("output_config") == {"effort": "high"}  # balanced default
+    assert "temperature" not in fake.seen["inferenceConfig"]
+    assert fake.seen["inferenceConfig"]["maxTokens"] == 16000  # balanced profile
+
+
+def test_mantle_route_returns_openai_shape(monkeypatch):
+    async def fake_complete(model_id, body, region, public_id, defaults=None):
+        assert model_id == "openai.gpt-5.6-sol"
+        assert public_id == "gpt-5.6-sol"
+        return {
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": public_id,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(mantle, "complete", fake_complete)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5.6-sol", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["model"] == "gpt-5.6-sol"
+    assert data["choices"][0]["message"]["content"] == "pong"
+
+
+def test_openai_compat_missing_key_502(monkeypatch):
+    # gpt-5 is an openai_compat template; enable it in a throwaway copy so the
+    # route is exercised without a real OpenAI key present.
+    from oasis_generation import catalog
+
+    entry = next(m for m in catalog.CATALOG if m.public_id == "gpt-5")
+    monkeypatch.setattr(entry, "enabled", True)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-5", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 502
+    assert "OPENAI_API_KEY" in resp.json()["detail"]

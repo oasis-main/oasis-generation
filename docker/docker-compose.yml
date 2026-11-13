@@ -9,11 +9,61 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.gateway
+    restart: unless-stopped  # fleet dependency: Nimbus's oasis-generation provider
+    # Defensive cap only — the gateway is a ~100 MB proxy, NOT the memory user.
+    # The 12 GB hog is Docker Model Runner (llama.cpp on the host, Metal), which
+    # is not a container and cannot be mem_limited here. memswap_limit == mem_limit
+    # forbids this container from touching swap (guards against a swap spiral).
+    mem_limit: 512m
+    memswap_limit: 512m
     ports:
       - "8800:8800"
+    # Secrets (service tokens + the Bedrock/oasis-dev AWS key) come from
+    # docker/.env via env_file — NOT `environment: ${VAR:-}` interpolation,
+    # which lets an empty shell export silently shadow the file (the mistake
+    # oasis-claw hit with Anthropic auth). env_file always wins.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Non-secret knobs only.
       OASIS_GENERATION_UPSTREAM_BASE_URL: ${OASIS_GENERATION_UPSTREAM_BASE_URL:-http://model-runner.docker.internal/engines/llama.cpp/v1}
-      OASIS_GENERATION_SERVICE_TOKENS: ${OASIS_GENERATION_SERVICE_TOKENS:-}
+      # Bedrock backend (GEN-003). Credentials themselves come from env_file
+      # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY); this is just the region.
+      OASIS_GENERATION_BEDROCK_REGION: ${OASIS_GENERATION_BEDROCK_REGION:-us-east-1}
+      # Per-bot route switch (GEN-008, src/oasis_generation/remote.py). The remote
+      # gateway (Hetzner VM) URL is not secret; its token and the admin token are
+      # FILES in the read-only secrets mount below, never env vars.
+      OASIS_GENERATION_REMOTE_BASE_URL: ${OASIS_GENERATION_REMOTE_BASE_URL:-}
+      # The seven fleet bots may switch THEMSELVES (Telegram /genroute). Not "*":
+      # product service tokens (e.g. kinematics) must not move their own traffic.
+      # "" turns self-switch off; the observatory (admin token) can switch any client.
+      OASIS_GENERATION_SELF_SWITCH_CLIENTS: ${OASIS_GENERATION_SELF_SWITCH_CLIENTS:-house,kolmogorov,yesman,butterbolt,vanhelsing,hello-world,nimbus}
+    # Dual-homed like the oasis-voice / oasis-semantics sidecars: the project
+    # `default` net keeps the gateway's own internet egress (Bedrock / mantle),
+    # while the fleet's `oasis_sandboxed` net lets the egress-LOCKED bots reach
+    # the gateway INTERNALLY by the `oasis-generation` alias (they set
+    # OASIS_GENERATION_URL=http://oasis-generation:8800/v1 + NO_PROXY it). This is
+    # the "egress collapses to gateway + Telegram" model: bots never touch the
+    # internet directly; the gateway makes the external calls. Nimbus (non-sandboxed)
+    # keeps using host.docker.internal:8800 via the published port below.
+    # Per-request usage ledger (ADM-050). Host-side and gitignored: the
+    # container is recreated on every deploy, so an in-container path would
+    # lose the history the ledger exists to accumulate. Records who called
+    # which model — never prompt or completion content.
+    volumes:
+      - ../usage:/usage
+      # Route switch state + audit (routing.json, routing-audit.jsonl): host-side
+      # so a recreate keeps every bot's switch. Gitignored.
+      - ../state:/state
+      # admin-token (observatory only) and remote-token (the VM's "fleet" token).
+      # Mode 600 on the host; read-only here. Missing files = feature off.
+      - "${OASIS_GENERATION_SECRETS_DIR:-${HOME}/Library/Application Support/oasis-x/generation}:/secrets/generation:ro"
+    networks:
+      default: {}
+      oasis_sandboxed:
+        aliases:
+          - oasis-generation
 
   runner:
     profiles: ["gpu"]
@@ -29,3 +79,11 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+networks:
+  # The oasis-claw fleet's sandboxed network (created by that project). Declared
+  # external so the gateway can dual-home onto it without owning it; if the fleet
+  # isn't up, `docker compose up` will error until the network exists.
+  oasis_sandboxed:
+    external: true
+    name: oasis-claw_oasis_sandboxed

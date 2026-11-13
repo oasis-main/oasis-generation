@@ -271,3 +271,74 @@ def test_bridge_routes_snapshot_to_state_and_refuses_a_bad_one(caplog):
         fake.on_message(fake, None, FakeMsg("oasis/system/auth/billing/snapshot", b'{"event_id": "s2"}'))
     assert any("refused a bad event" in r.message for r in caplog.records)
     assert state.is_blocked("u7")
+
+
+# ---- backstop B: boot_id and seq for gap detection ----
+
+def test_emit_stamps_boot_id_and_seq_from_one(tmp_path):
+    pub = FakePublisher()
+    meter = m.UsageMeter(pub, str(tmp_path))
+    for _ in range(3):
+        meter.emit(_event())
+    assert [e["seq"] for _, e, _ in pub.sent] == [1, 2, 3]
+    assert {e["boot_id"] for _, e, _ in pub.sent} == {meter.boot_id}
+    assert len(meter.boot_id) == 32
+
+
+def test_seq_is_assigned_before_the_spool_and_survives_resend(tmp_path):
+    pub = FakePublisher(ok=False)
+    meter = m.UsageMeter(pub, str(tmp_path))
+    meter.emit(_event())
+    meter.emit(_event())
+    pub.ok = True
+    meter.emit(_event())           # published at once, ahead of the spool
+    assert [e["seq"] for _, e, _ in pub.sent] == [3]
+    assert meter.flush() == 2
+    assert sorted(e["seq"] for _, e, _ in pub.sent) == [1, 2, 3]   # no hole, no renumbering
+
+
+def test_a_new_process_gets_a_new_boot_id_and_restarts_at_one(tmp_path):
+    a = m.UsageMeter(FakePublisher(), str(tmp_path))
+    b = m.UsageMeter(FakePublisher(), str(tmp_path))
+    assert a.boot_id != b.boot_id
+    pub = FakePublisher()
+    c = m.UsageMeter(pub, str(tmp_path))
+    c.emit(_event())
+    assert pub.sent[0][1]["seq"] == 1
+
+
+def test_an_event_that_already_has_a_boot_id_is_not_restamped(tmp_path):
+    pub = FakePublisher()
+    meter = m.UsageMeter(pub, str(tmp_path))
+    meter.emit(_event(boot_id="fixed", seq=41))
+    assert pub.sent[0][1]["boot_id"] == "fixed" and pub.sent[0][1]["seq"] == 41
+
+
+def test_concurrent_emits_never_reuse_a_seq(tmp_path):
+    import threading
+    pub = FakePublisher()
+    meter = m.UsageMeter(pub, str(tmp_path))
+    ts = [threading.Thread(target=lambda: [meter.emit(_event()) for _ in range(50)]) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    seqs = sorted(e["seq"] for _, e, _ in pub.sent)
+    assert seqs == list(range(1, 401))
+
+
+def test_shutdown_flushes_the_spool_once(tmp_path, monkeypatch):
+    import asyncio
+    from oasis_generation import browser_stream, main
+    calls = []
+
+    class _Meter:
+        def flush(self):
+            calls.append(1)
+            return 0
+
+    class _Rt:
+        meter = _Meter()
+        bridge = None
+
+    monkeypatch.setattr(browser_stream, "_runtime", _Rt())
+    asyncio.run(main._shutdown())
+    assert calls == [1]

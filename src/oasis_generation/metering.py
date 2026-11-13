@@ -96,6 +96,12 @@ class UsageMeter:
         self._lock = threading.Lock()
         self._broken = False
         self._spooled_at: list[float] = []   # one entry per spooled line, in order
+        # Gap detection (backstop B): the sink checks that seq runs 1, 2, 3...
+        # for each boot_id. A hole is an event lost before it reached the
+        # broker, including a spool that died with its task. The counter is
+        # per process: a restart gets a new boot_id and starts again at 1.
+        self.boot_id = uuid.uuid4().hex
+        self._seq = 0
         self._load()
 
     @property
@@ -131,8 +137,20 @@ class UsageMeter:
             logger.warning("usage publish raised %s", type(exc).__name__)
             return False
 
+    def _stamp(self, event: dict) -> None:
+        """Add boot_id and the next seq. Done before publish or spool, so a
+        spooled event keeps the number it was given. An event that already
+        carries a boot_id (a test, a replay) is left alone."""
+        if "boot_id" in event:
+            return
+        with self._lock:
+            self._seq += 1
+            event["boot_id"] = self.boot_id
+            event["seq"] = self._seq
+
     def emit(self, event: dict) -> None:
         """Publish now, or spool. Never raises."""
+        self._stamp(event)
         if self._publish(event):
             return
         line = json.dumps({"spooled_at": self._clock(), "event": event}, separators=(",", ":"))

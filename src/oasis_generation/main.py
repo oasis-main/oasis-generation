@@ -86,6 +86,13 @@ async def _shutdown() -> None:
     if task is not None:
         task.cancel()
     rt = browser_stream._runtime
+    if rt is not None:
+        # One last resend of the spool before the task goes (a normal deploy
+        # sends SIGTERM). A hard kill still loses it; the seq gap shows how much.
+        try:
+            await asyncio.wait_for(asyncio.to_thread(rt.meter.flush), timeout=5.0)
+        except Exception:  # noqa: BLE001 - shutdown must finish
+            logger.exception("usage spool final flush failed")
     if rt is not None and rt.bridge is not None:
         rt.bridge.stop()
 

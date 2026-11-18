@@ -605,6 +605,17 @@ def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
     return "".join(text_parts), "".join(reasoning_parts), tool_calls
 
 
+def request_id_of(resp: dict | None) -> str | None:
+    """The provider's own id for one call (boto3 ResponseMetadata.RequestId), or None.
+
+    Written onto the usage event as `upstream_request_id` so the daily
+    reconciliation (ORG-171 backstop C) can match our record of a call against
+    the provider's invocation log."""
+    meta = (resp or {}).get("ResponseMetadata") or {}
+    rid = meta.get("RequestId") or (meta.get("HTTPHeaders") or {}).get("x-amzn-requestid")
+    return rid if isinstance(rid, str) and rid else None
+
+
 def _usage(u: dict | None) -> dict:
     u = u or {}
     read = u.get("cacheReadInputTokens", 0) or 0
@@ -671,6 +682,9 @@ async def complete(
     out = converse_to_openai(
         resp, public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
     )
+    rid = request_id_of(resp)
+    if rid:
+        out["upstream_request_id"] = rid
     _log_outcome(model_id, public_id, resp.get("stopReason"), out["usage"], streamed=False)
     return out
 
@@ -715,10 +729,16 @@ async def stream(
     # browser stream). The worker then closes the Converse event stream, which
     # ends the upstream call instead of reading it to the end.
     stop = threading.Event()
+    # Filled by the worker as soon as the call is accepted; read by _relay when
+    # it writes the last chunk.
+    meta: dict[str, str] = {}
 
     def worker() -> None:
         try:
             resp = _client(region).converse_stream(modelId=model_id, **kwargs)
+            rid = request_id_of(resp)
+            if rid:
+                meta["upstream_request_id"] = rid
             events = resp["stream"]
             for event in events:
                 if stop.is_set():
@@ -743,13 +763,14 @@ async def stream(
 
     loop.run_in_executor(None, worker)
     try:
-        async for frame in _relay(queue, base, outcome, model_id, public_id, include_usage):
+        async for frame in _relay(queue, base, outcome, model_id, public_id, include_usage, meta):
             yield frame
     finally:
         stop.set()
 
 
-async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> AsyncIterator[bytes]:
+async def _relay(queue, base, outcome, model_id, public_id, include_usage,
+                 meta: dict | None = None) -> AsyncIterator[bytes]:
     """The queue -> OpenAI SSE half of stream(); split out so stream() can
     signal the worker in a finally block when its caller closes it early."""
     # Open with the assistant role so clients see a well-formed first chunk.
@@ -814,6 +835,8 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> As
     final = base({}, finish_reason)
     if stop_reason:
         final["choices"][0]["upstream_stop_reason"] = stop_reason
+    if meta and meta.get("upstream_request_id"):
+        final["upstream_request_id"] = meta["upstream_request_id"]
     if include_usage and usage is not None:
         final["usage"] = usage
     yield _sse(final)

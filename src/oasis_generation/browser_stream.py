@@ -460,14 +460,15 @@ class Translator:
 
     def on_chunk(self, chunk: dict) -> list[tuple[str, dict]]:
         out: list[tuple[str, dict]] = []
+        # Read the id first: an error frame and a stopped stream still carry it.
+        rid = chunk.get("upstream_request_id")
+        if isinstance(rid, str) and rid:
+            self.upstream_request_id = rid[:128]
         if chunk.get("error"):
             self.error = str(chunk["error"])
             return out
         if isinstance(chunk.get("usage"), dict):
             self.usage = chunk["usage"]
-        rid = chunk.get("upstream_request_id")
-        if isinstance(rid, str) and rid:
-            self.upstream_request_id = rid[:128]
         for choice in chunk.get("choices") or []:
             if not isinstance(choice, dict):
                 continue

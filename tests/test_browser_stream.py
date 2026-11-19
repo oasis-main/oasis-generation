@@ -200,6 +200,66 @@ def test_usage_event_has_no_upstream_request_id_when_provider_gave_none(cap, mon
     assert "upstream_request_id" not in pub.events[0]
 
 
+def test_stopped_stream_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    # A client stop never reaches the last chunk; the id must already be out.
+    rt, pub = cap
+    gate = threading.Event()
+    fake = FakeBedrock(BEDROCK_EVENTS, gate=gate)
+    fake.request_id = "rid-stopped"
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    req = bs.parse_body(body())
+    assert rt.claim("user_1", req.client_request_id)
+    claims = {"sub": "user_1", "jti": "j", "allowance_ref": "allow_user_1_2026-10"}
+
+    async def scenario():
+        gen = bs.stream_session(rt=rt, settings=get_settings(), entry=catalog.resolve("claude-sonnet-5"),
+                                req=req, claims=claims, request_id="req_t")
+        await gen.__anext__()   # start
+        await gen.__anext__()   # thinking (first content chunk); worker waits at the gate
+        await gen.aclose()
+        gate.set()
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    (ev,) = pub.events
+    assert ev["status"] == "stopped" and ev["usage_estimated"] is True
+    assert ev["upstream_request_id"] == "rid-stopped"
+
+
+def test_throttle_error_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    # botocore puts the request id on ClientError.response; a throttled call is
+    # still logged by the provider, so the estimated event must carry the id.
+    class Throttled(RuntimeError):
+        response = {"ResponseMetadata": {"RequestId": "rid-throttle", "HTTPStatusCode": 429}}
+
+    rt, pub = cap
+    monkeypatch.setattr(bedrock, "_client",
+                        lambda region: FakeBedrock(exc=Throttled("ThrottlingException: slow down")))
+    r = client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert [e for e, _ in frames(r.text)] == ["start", "error"]
+    assert "rid-throttle" not in r.text
+    (ev,) = pub.events
+    assert ev["status"] == "error" and ev["usage_estimated"] is True
+    assert ev["upstream_request_id"] == "rid-throttle"
+
+
+def test_mid_stream_error_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    class Dying(FakeEventStream):
+        def __iter__(self):
+            yield BEDROCK_EVENTS[1]
+            raise RuntimeError("ModelStreamErrorException")
+
+    rt, pub = cap
+    fake = FakeBedrock()
+    fake.stream = Dying([])
+    fake.request_id = "rid-mid"
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    r = client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert frames(r.text)[-1][0] == "error"
+    (ev,) = pub.events
+    assert ev["status"] == "error" and ev["upstream_request_id"] == "rid-mid"
+
+
 def test_mantle_usage_event_carries_upstream_request_id(cap, monkeypatch):
     async def fake_complete(model_id, body, region, public_id, defaults=None):
         return {"id": "c", "object": "chat.completion", "created": 0, "model": public_id,

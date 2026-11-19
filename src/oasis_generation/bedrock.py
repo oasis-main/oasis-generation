@@ -605,6 +605,14 @@ def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
     return "".join(text_parts), "".join(reasoning_parts), tool_calls
 
 
+def request_id_of_error(exc: BaseException) -> str | None:
+    """The provider request id on a failed call (botocore ClientError.response), or None.
+
+    A throttle or validation error is still a call the provider logged, so the
+    id is what lets the daily reconciliation match it."""
+    return request_id_of(getattr(exc, "response", None))
+
+
 def request_id_of(resp: dict | None) -> str | None:
     """The provider's own id for one call (boto3 ResponseMetadata.RequestId), or None.
 
@@ -729,8 +737,8 @@ async def stream(
     # browser stream). The worker then closes the Converse event stream, which
     # ends the upstream call instead of reading it to the end.
     stop = threading.Event()
-    # Filled by the worker as soon as the call is accepted; read by _relay when
-    # it writes the last chunk.
+    # Filled by the worker as soon as the call is accepted (or fails); _relay
+    # puts it on the first content chunk, the error frame and the last chunk.
     meta: dict[str, str] = {}
 
     def worker() -> None:
@@ -757,6 +765,9 @@ async def stream(
                 "bedrock stream() failed model_id=%s public_id=%s region=%s",
                 model_id, public_id, region,
             )
+            rid = request_id_of_error(exc)
+            if rid and "upstream_request_id" not in meta:
+                meta["upstream_request_id"] = rid
             loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
@@ -775,6 +786,19 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage,
     signal the worker in a finally block when its caller closes it early."""
     # Open with the assistant role so clients see a well-formed first chunk.
     yield _sse(base({"role": "assistant"}))
+    rid_sent = False
+
+    def stamp(chunk: dict) -> dict:
+        """Add the provider request id to a chunk once it is known. The id rides
+        the first chunk after the call is accepted, so a stream that is stopped
+        or fails midway still carries it (the last chunk is never reached then)."""
+        nonlocal rid_sent
+        rid = (meta or {}).get("upstream_request_id")
+        if rid and not rid_sent:
+            chunk["upstream_request_id"] = rid
+            rid_sent = True
+        return chunk
+
     finish_reason = "stop"
     stop_reason: str | None = None
     usage: dict | None = None
@@ -789,7 +813,10 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage,
         if kind == "error":
             # Emit a terminal error frame, then close cleanly.
             stop_reason = "gateway_error"
-            yield _sse(base({}, "stop") | {"error": str(payload)})
+            err = base({}, "stop") | {"error": str(payload)}
+            if (meta or {}).get("upstream_request_id"):
+                err["upstream_request_id"] = meta["upstream_request_id"]
+            yield _sse(err)
             break
         event = payload
         if "contentBlockStart" in event:
@@ -800,29 +827,29 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage,
             if tu:
                 block_idx = event["contentBlockStart"].get("contentBlockIndex")
                 tool_index_by_block[block_idx] = next_tool_index
-                yield _sse(base({"tool_calls": [{
+                yield _sse(stamp(base({"tool_calls": [{
                     "index": next_tool_index,
                     "id": tu.get("toolUseId") or "",
                     "type": "function",
                     "function": {"name": tu.get("name") or "", "arguments": ""},
-                }]}))
+                }]})))
                 next_tool_index += 1
         elif "contentBlockDelta" in event:
             cbd = event["contentBlockDelta"]
             delta = cbd.get("delta", {})
             if "text" in delta:
-                yield _sse(base({"content": delta["text"]}))
+                yield _sse(stamp(base({"content": delta["text"]})))
             elif "toolUse" in delta:
                 # Partial JSON string fragment for the open tool call.
                 tool_idx = tool_index_by_block.get(cbd.get("contentBlockIndex"), 0)
-                yield _sse(base({"tool_calls": [{
+                yield _sse(stamp(base({"tool_calls": [{
                     "index": tool_idx,
                     "function": {"arguments": (delta["toolUse"] or {}).get("input", "")},
-                }]}))
+                }]})))
             elif "reasoningContent" in delta:
                 rt = (delta["reasoningContent"] or {}).get("text")
                 if rt:
-                    yield _sse(base({"reasoning_content": rt}))
+                    yield _sse(stamp(base({"reasoning_content": rt})))
         elif "messageStop" in event:
             stop_reason = event["messageStop"].get("stopReason")
             finish_reason = _finish_reason(stop_reason)

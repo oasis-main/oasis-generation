@@ -337,6 +337,9 @@ async def complete(
         logger.error("mantle complete() %s for %s: %s", resp.status_code, public_id, resp.text[:300])
         raise RuntimeError(f"bedrock-mantle {resp.status_code}: {resp.text[:300]}")
     out = responses_to_openai(resp.json(), public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time()))
+    rid = resp.headers.get("x-amzn-requestid") or resp.headers.get("x-request-id")
+    if rid:
+        out["upstream_request_id"] = rid
     choice = out["choices"][0]
     stop = choice.get("upstream_stop_reason")
     output_tokens = out["usage"].get("completion_tokens")
@@ -403,5 +406,7 @@ async def stream(
     # caller asked for it (openclaw does, via compat.supportsUsageInStreaming).
     if (body.get("stream_options") or {}).get("include_usage") and result.get("usage"):
         final["usage"] = result["usage"]
+    if result.get("upstream_request_id"):
+        final["upstream_request_id"] = result["upstream_request_id"]
     yield _sse(final)
     yield b"data: [DONE]\n\n"

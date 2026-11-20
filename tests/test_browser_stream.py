@@ -121,11 +121,16 @@ class FakeBedrock:
         self.exc = exc
         self.seen = None
 
+    request_id = None  # set to put ResponseMetadata on the reply, as boto3 does
+
     def converse_stream(self, **kw):
         self.seen = kw
         if self.exc:
             raise self.exc
-        return {"stream": self.stream}
+        out = {"stream": self.stream}
+        if self.request_id:
+            out["ResponseMetadata"] = {"RequestId": self.request_id, "HTTPStatusCode": 200}
+        return out
 
 
 BEDROCK_EVENTS = [
@@ -173,6 +178,101 @@ def test_bedrock_stream_events_seq_and_usage_event(cap, monkeypatch):
     assert "usage_estimated" not in ev
     # The in-flight id is released when the stream ends.
     assert rt.claim("user_1", b["client_request_id"])
+
+
+def test_bedrock_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    rt, pub = cap
+    fake = FakeBedrock(BEDROCK_EVENTS)
+    fake.request_id = "11111111-2222-3333-4444-555555555555"
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    r = client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert r.status_code == 200
+    (ev,) = pub.events
+    assert ev["upstream_request_id"] == "11111111-2222-3333-4444-555555555555"
+    # The id is for the reconciliation only; it is not shown to the browser.
+    assert "11111111-2222" not in r.text
+
+
+def test_usage_event_has_no_upstream_request_id_when_provider_gave_none(cap, monkeypatch):
+    rt, pub = cap
+    monkeypatch.setattr(bedrock, "_client", lambda region: FakeBedrock(BEDROCK_EVENTS))
+    client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert "upstream_request_id" not in pub.events[0]
+
+
+def test_stopped_stream_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    # A client stop never reaches the last chunk; the id must already be out.
+    rt, pub = cap
+    gate = threading.Event()
+    fake = FakeBedrock(BEDROCK_EVENTS, gate=gate)
+    fake.request_id = "rid-stopped"
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    req = bs.parse_body(body())
+    assert rt.claim("user_1", req.client_request_id)
+    claims = {"sub": "user_1", "jti": "j", "allowance_ref": "allow_user_1_2026-10"}
+
+    async def scenario():
+        gen = bs.stream_session(rt=rt, settings=get_settings(), entry=catalog.resolve("claude-sonnet-5"),
+                                req=req, claims=claims, request_id="req_t")
+        await gen.__anext__()   # start
+        await gen.__anext__()   # thinking (first content chunk); worker waits at the gate
+        await gen.aclose()
+        gate.set()
+        await asyncio.sleep(0.2)
+
+    asyncio.run(scenario())
+    (ev,) = pub.events
+    assert ev["status"] == "stopped" and ev["usage_estimated"] is True
+    assert ev["upstream_request_id"] == "rid-stopped"
+
+
+def test_throttle_error_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    # botocore puts the request id on ClientError.response; a throttled call is
+    # still logged by the provider, so the estimated event must carry the id.
+    class Throttled(RuntimeError):
+        response = {"ResponseMetadata": {"RequestId": "rid-throttle", "HTTPStatusCode": 429}}
+
+    rt, pub = cap
+    monkeypatch.setattr(bedrock, "_client",
+                        lambda region: FakeBedrock(exc=Throttled("ThrottlingException: slow down")))
+    r = client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert [e for e, _ in frames(r.text)] == ["start", "error"]
+    assert "rid-throttle" not in r.text
+    (ev,) = pub.events
+    assert ev["status"] == "error" and ev["usage_estimated"] is True
+    assert ev["upstream_request_id"] == "rid-throttle"
+
+
+def test_mid_stream_error_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    class Dying(FakeEventStream):
+        def __iter__(self):
+            yield BEDROCK_EVENTS[1]
+            raise RuntimeError("ModelStreamErrorException")
+
+    rt, pub = cap
+    fake = FakeBedrock()
+    fake.stream = Dying([])
+    fake.request_id = "rid-mid"
+    monkeypatch.setattr(bedrock, "_client", lambda region: fake)
+    r = client.post("/v1/chat/stream", json=body(), headers=auth())
+    assert frames(r.text)[-1][0] == "error"
+    (ev,) = pub.events
+    assert ev["status"] == "error" and ev["upstream_request_id"] == "rid-mid"
+
+
+def test_mantle_usage_event_carries_upstream_request_id(cap, monkeypatch):
+    async def fake_complete(model_id, body, region, public_id, defaults=None):
+        return {"id": "c", "object": "chat.completion", "created": 0, "model": public_id,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "x"},
+                             "finish_reason": "stop", "upstream_stop_reason": "completed"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14,
+                          "prompt_tokens_details": {"cached_tokens": 0}},
+                "upstream_request_id": "req-mantle-1"}
+
+    monkeypatch.setattr(mantle, "complete", fake_complete)
+    rt, pub = cap
+    client.post("/v1/chat/stream", json=body("gpt-5.6-sol"), headers=auth())
+    assert pub.events[0]["upstream_request_id"] == "req-mantle-1"
 
 
 def test_bedrock_tool_call_ends_with_tool_calls(cap, monkeypatch):

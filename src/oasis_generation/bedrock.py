@@ -605,6 +605,25 @@ def _extract_content(content_blocks: list[dict]) -> tuple[str, str, list[dict]]:
     return "".join(text_parts), "".join(reasoning_parts), tool_calls
 
 
+def request_id_of_error(exc: BaseException) -> str | None:
+    """The provider request id on a failed call (botocore ClientError.response), or None.
+
+    A throttle or validation error is still a call the provider logged, so the
+    id is what lets the daily reconciliation match it."""
+    return request_id_of(getattr(exc, "response", None))
+
+
+def request_id_of(resp: dict | None) -> str | None:
+    """The provider's own id for one call (boto3 ResponseMetadata.RequestId), or None.
+
+    Written onto the usage event as `upstream_request_id` so the daily
+    reconciliation (ORG-171 backstop C) can match our record of a call against
+    the provider's invocation log."""
+    meta = (resp or {}).get("ResponseMetadata") or {}
+    rid = meta.get("RequestId") or (meta.get("HTTPHeaders") or {}).get("x-amzn-requestid")
+    return rid if isinstance(rid, str) and rid else None
+
+
 def _usage(u: dict | None) -> dict:
     u = u or {}
     read = u.get("cacheReadInputTokens", 0) or 0
@@ -671,6 +690,9 @@ async def complete(
     out = converse_to_openai(
         resp, public_id, f"chatcmpl-{uuid.uuid4().hex}", int(time.time())
     )
+    rid = request_id_of(resp)
+    if rid:
+        out["upstream_request_id"] = rid
     _log_outcome(model_id, public_id, resp.get("stopReason"), out["usage"], streamed=False)
     return out
 
@@ -715,10 +737,16 @@ async def stream(
     # browser stream). The worker then closes the Converse event stream, which
     # ends the upstream call instead of reading it to the end.
     stop = threading.Event()
+    # Filled by the worker as soon as the call is accepted (or fails); _relay
+    # puts it on the first content chunk, the error frame and the last chunk.
+    meta: dict[str, str] = {}
 
     def worker() -> None:
         try:
             resp = _client(region).converse_stream(modelId=model_id, **kwargs)
+            rid = request_id_of(resp)
+            if rid:
+                meta["upstream_request_id"] = rid
             events = resp["stream"]
             for event in events:
                 if stop.is_set():
@@ -737,23 +765,40 @@ async def stream(
                 "bedrock stream() failed model_id=%s public_id=%s region=%s",
                 model_id, public_id, region,
             )
+            rid = request_id_of_error(exc)
+            if rid and "upstream_request_id" not in meta:
+                meta["upstream_request_id"] = rid
             loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
     loop.run_in_executor(None, worker)
     try:
-        async for frame in _relay(queue, base, outcome, model_id, public_id, include_usage):
+        async for frame in _relay(queue, base, outcome, model_id, public_id, include_usage, meta):
             yield frame
     finally:
         stop.set()
 
 
-async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> AsyncIterator[bytes]:
+async def _relay(queue, base, outcome, model_id, public_id, include_usage,
+                 meta: dict | None = None) -> AsyncIterator[bytes]:
     """The queue -> OpenAI SSE half of stream(); split out so stream() can
     signal the worker in a finally block when its caller closes it early."""
     # Open with the assistant role so clients see a well-formed first chunk.
     yield _sse(base({"role": "assistant"}))
+    rid_sent = False
+
+    def stamp(chunk: dict) -> dict:
+        """Add the provider request id to a chunk once it is known. The id rides
+        the first chunk after the call is accepted, so a stream that is stopped
+        or fails midway still carries it (the last chunk is never reached then)."""
+        nonlocal rid_sent
+        rid = (meta or {}).get("upstream_request_id")
+        if rid and not rid_sent:
+            chunk["upstream_request_id"] = rid
+            rid_sent = True
+        return chunk
+
     finish_reason = "stop"
     stop_reason: str | None = None
     usage: dict | None = None
@@ -768,7 +813,10 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> As
         if kind == "error":
             # Emit a terminal error frame, then close cleanly.
             stop_reason = "gateway_error"
-            yield _sse(base({}, "stop") | {"error": str(payload)})
+            err = base({}, "stop") | {"error": str(payload)}
+            if (meta or {}).get("upstream_request_id"):
+                err["upstream_request_id"] = meta["upstream_request_id"]
+            yield _sse(err)
             break
         event = payload
         if "contentBlockStart" in event:
@@ -779,29 +827,29 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> As
             if tu:
                 block_idx = event["contentBlockStart"].get("contentBlockIndex")
                 tool_index_by_block[block_idx] = next_tool_index
-                yield _sse(base({"tool_calls": [{
+                yield _sse(stamp(base({"tool_calls": [{
                     "index": next_tool_index,
                     "id": tu.get("toolUseId") or "",
                     "type": "function",
                     "function": {"name": tu.get("name") or "", "arguments": ""},
-                }]}))
+                }]})))
                 next_tool_index += 1
         elif "contentBlockDelta" in event:
             cbd = event["contentBlockDelta"]
             delta = cbd.get("delta", {})
             if "text" in delta:
-                yield _sse(base({"content": delta["text"]}))
+                yield _sse(stamp(base({"content": delta["text"]})))
             elif "toolUse" in delta:
                 # Partial JSON string fragment for the open tool call.
                 tool_idx = tool_index_by_block.get(cbd.get("contentBlockIndex"), 0)
-                yield _sse(base({"tool_calls": [{
+                yield _sse(stamp(base({"tool_calls": [{
                     "index": tool_idx,
                     "function": {"arguments": (delta["toolUse"] or {}).get("input", "")},
-                }]}))
+                }]})))
             elif "reasoningContent" in delta:
                 rt = (delta["reasoningContent"] or {}).get("text")
                 if rt:
-                    yield _sse(base({"reasoning_content": rt}))
+                    yield _sse(stamp(base({"reasoning_content": rt})))
         elif "messageStop" in event:
             stop_reason = event["messageStop"].get("stopReason")
             finish_reason = _finish_reason(stop_reason)
@@ -814,6 +862,8 @@ async def _relay(queue, base, outcome, model_id, public_id, include_usage) -> As
     final = base({}, finish_reason)
     if stop_reason:
         final["choices"][0]["upstream_stop_reason"] = stop_reason
+    if meta and meta.get("upstream_request_id"):
+        final["upstream_request_id"] = meta["upstream_request_id"]
     if include_usage and usage is not None:
         final["usage"] = usage
     yield _sse(final)

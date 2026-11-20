@@ -447,6 +447,7 @@ class Translator:
     usage: dict | None = None
     error: str | None = None
     chars_out: int = 0
+    upstream_request_id: str | None = None
     tools: dict[int, _Tool] = field(default_factory=dict)
     open_tool: int | None = None
 
@@ -459,6 +460,10 @@ class Translator:
 
     def on_chunk(self, chunk: dict) -> list[tuple[str, dict]]:
         out: list[tuple[str, dict]] = []
+        # Read the id first: an error frame and a stopped stream still carry it.
+        rid = chunk.get("upstream_request_id")
+        if isinstance(rid, str) and rid:
+            self.upstream_request_id = rid[:128]
         if chunk.get("error"):
             self.error = str(chunk["error"])
             return out
@@ -638,6 +643,8 @@ def _meter(rt: CapabilityRuntime, entry: CatalogEntry, req: StreamRequest, claim
                  "tokens_out": _estimate_tokens(tr.chars_out),
                  "cache_read_tokens": 0, "cache_write_tokens": 0}
             extra["usage_estimated"] = True
+        if tr.upstream_request_id:
+            extra["upstream_request_id"] = tr.upstream_request_id
         rt.meter.emit(build_usage_event(
             sub=claims["sub"], jti=claims["jti"], allowance_ref=claims.get("allowance_ref") or "",
             request_id=request_id, client_request_id=req.client_request_id,

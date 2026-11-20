@@ -226,3 +226,100 @@ def test_ledger_non_streamed_row_has_stop_reason(monkeypatch, tmp_path):
     assert row["stop_reason"] == "end_turn"
     assert row["finish_reason"] == "stop"
     assert row["completion_tokens"] == 1
+
+
+# ---- upstream request id (ORG-171 backstop C) ----------------------------------
+
+
+def test_request_id_of_reads_boto3_metadata():
+    assert bedrock.request_id_of({"ResponseMetadata": {"RequestId": "abc"}}) == "abc"
+    assert bedrock.request_id_of(
+        {"ResponseMetadata": {"HTTPHeaders": {"x-amzn-requestid": "hdr"}}}) == "hdr"
+    assert bedrock.request_id_of({"ResponseMetadata": {"RequestId": ""}}) is None
+    assert bedrock.request_id_of({}) is None
+    assert bedrock.request_id_of(None) is None
+
+
+def test_bedrock_stream_last_chunk_carries_request_id(monkeypatch):
+    class C:
+        def converse_stream(self, **_kw):
+            return {"stream": iter(_filtered_events()),
+                    "ResponseMetadata": {"RequestId": "rid-1"}}
+
+    monkeypatch.setattr(bedrock, "_client", lambda region: C())
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True}
+    frames = _frames(asyncio.run(_collect(bedrock.stream("m", body, "us-east-1", "p"))))
+    assert frames[-1]["upstream_request_id"] == "rid-1"
+    assert all("upstream_request_id" not in f for f in frames[:-1])
+
+
+def test_bedrock_complete_carries_request_id(monkeypatch):
+    class C:
+        def converse(self, **_kw):
+            return {"output": {"message": {"content": [{"text": "hi"}]}}, "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                    "ResponseMetadata": {"RequestId": "rid-2"}}
+
+    monkeypatch.setattr(bedrock, "_client", lambda region: C())
+    out = asyncio.run(bedrock.complete("m", {"messages": [{"role": "user", "content": "x"}]},
+                                       "us-east-1", "p"))
+    assert out["upstream_request_id"] == "rid-2"
+
+
+def test_mantle_stream_last_chunk_carries_request_id(monkeypatch):
+    async def fake_complete(model_id, body, region, public_id, defaults=None):
+        out = mantle.responses_to_openai({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "status": "completed", "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+        }, public_id, "chatcmpl-x", 0)
+        out["upstream_request_id"] = "rid-3"
+        return out
+
+    monkeypatch.setattr(mantle, "complete", fake_complete)
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True}
+    frames = _frames(asyncio.run(_collect(mantle.stream("m", body, "us-east-1", "p"))))
+    assert frames[-1]["upstream_request_id"] == "rid-3"
+
+
+def test_bedrock_stream_first_content_chunk_and_last_chunk_carry_request_id(monkeypatch):
+    events = [
+        {"contentBlockDelta": {"delta": {"text": "a"}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"text": "b"}, "contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 2, "totalTokens": 3}}},
+    ]
+
+    class C:
+        def converse_stream(self, **_kw):
+            return {"stream": iter(events), "ResponseMetadata": {"RequestId": "rid-4"}}
+
+    monkeypatch.setattr(bedrock, "_client", lambda region: C())
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True}
+    frames = _frames(asyncio.run(_collect(bedrock.stream("m", body, "us-east-1", "p"))))
+    # Role chunk may precede the id; the first content chunk has it; it is not repeated mid-stream.
+    ids = [f.get("upstream_request_id") for f in frames]
+    assert ids[1] == "rid-4" and ids[2] is None
+    assert ids[-1] == "rid-4"
+
+
+def test_bedrock_stream_error_frame_carries_request_id(monkeypatch):
+    class Err(Exception):
+        response = {"ResponseMetadata": {"RequestId": "rid-err"}}
+
+    class C:
+        def converse_stream(self, **_kw):
+            raise Err("ThrottlingException")
+
+    monkeypatch.setattr(bedrock, "_client", lambda region: C())
+    body = {"messages": [{"role": "user", "content": "x"}], "stream": True}
+    frames = _frames(asyncio.run(_collect(bedrock.stream("m", body, "us-east-1", "p"))))
+    err = [f for f in frames if f.get("error")]
+    assert err and err[0]["upstream_request_id"] == "rid-err"
+
+
+def test_request_id_of_error_reads_client_error_response():
+    class E(Exception):
+        response = {"ResponseMetadata": {"RequestId": "x1"}}
+
+    assert bedrock.request_id_of_error(E()) == "x1"
+    assert bedrock.request_id_of_error(RuntimeError("no response attr")) is None
